@@ -1,0 +1,13 @@
+[package]
+name = "landd-sim"
+description = "Offline land_runs.jsonl replay: actual fleet spend against landd's batch train and timeless cone cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+landd-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

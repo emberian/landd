@@ -1,0 +1,57 @@
+# A starter rule pack for the fleet tree. It shows each rule kind against
+# real paths; scopes, owners and allow-lists still need the review of whoever
+# owns the Python walker each rule replaces.
+#
+#   landd sweep --repo <fleet> --rules examples/fleet-gen3.rules.toml \
+#               --gateaudits <fleet>/gateaudits.json
+
+[imports]
+roots = [""]
+tests = ["tests/**/test_*.py", "bench/**/test_*.py"]
+implicit_conftest = true
+taint = "whole-tree"
+
+[[rule]]
+id = "no-tracked-bytecode"
+kind = "no_tracked_bytecode"
+
+[[rule]]
+id = "no-bare-python-recipe"
+kind = "no_bare_python_recipe"
+exclude = ["tests/*", "bench/*", "docs/*", "changes/*"]
+
+[[rule]]
+id = "flock-bounded"
+kind = "flock_bounded"
+include = ["fleetd/*", "fabd/*", "land/*", "scripts/*", "bin/*"]
+
+[[rule]]
+id = "atomic-replace-owner"
+kind = "atomic_replace_owner"
+why = "one owner of temp-and-rename; replaces the (relpath, function) census"
+include = ["fleetd/*", "fabd/*", "land/*", "scripts/*", "bin/*"]
+owners = ["fleetd/pk.py"]
+
+[[rule]]
+id = "uncatalogued-settings-keys"
+kind = "uncatalogued_settings_keys"
+include = ["fleetd/*", "fabd/*"]
+catalogs = ["fleetd/defaults.json", "fabd/defaults.json", "fleetd/fab-defaults.json"]
+readers = ["_setting", "_gen1_setting", "_setting_or"]
+
+[[rule]]
+id = "atomic-write-single-owner"
+kind = "single_owner_pattern"
+include = ["fleetd/*", "fabd/*", "land/*", "scripts/*", "bin/*"]
+owners = ["fleetd/pk.py"]
+functions = ["atomic_write"]
+
+[[rule]]
+id = "no-exception-stored-on-self"
+kind = "forbidden_symbol_or_call"
+include = ["fleetd/*", "fabd/*", "land/*"]
+facts = ["exception_stored_on_self"]
+
+[[rule]]
+id = "python-import-graph"
+kind = "python_import_graph"

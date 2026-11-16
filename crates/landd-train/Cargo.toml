@@ -1,0 +1,19 @@
+[package]
+name = "landd-train"
+description = "Speculative batch merge train: merge-tree composition, isolated test runner, culprit bisection, lease push"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+landd-core.workspace = true
+ast-sweep.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+landd-core = { workspace = true, features = ["testkit"] }
+tempfile.workspace = true

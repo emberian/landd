@@ -1,0 +1,21 @@
+# Every limit is a setting. Each key can also be given as `--set key=value`.
+
+max_batch_size = 8
+batch_coalesce_ms = 250      # a queue of one never waits
+test_timeout_s = 600
+max_reruns_on_flake = 1
+runner_concurrency = 4
+cache_dir = ".landd-cache"   # facts/, verdicts/, deliveries/, runs/
+custody_mode = "off"         # off | ed25519 | sshsig-ed25519 | hmac-sha256
+ast_sweep_enabled = true
+
+remote = "origin"
+target_ref = "refs/heads/main"
+cone_source = "python"       # python | manifest
+test_command = ["python3", "-m", "pytest", "-q", "{path}"]
+env_allow = ["PATH", "LANG", "LC_ALL", "TZ"]
+committer_name = "landd"
+committer_email = "landd@localhost"
+max_refusals = 5
+refusal_backoff_s = 5
+seat = "landd"

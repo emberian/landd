@@ -74,4 +74,4 @@ Every subsystem must carry positive AND negative (`#tooth`) tests:
 - **`Delivery` teeth**: lost reply (`Unknown`) refuses `start()`; `Declined` refuses `start()` at `u64::MAX`, **yet `Declined.complete(evidence)` succeeds** when forge ancestry confirms the commit landed; mismatched binding under same key errors.
 - **`CustodyEnvelopeV2` teeth**: adding 5 new unknown telemetry keys in `claims` still verifies cleanly with the *exact* original signature, while flipping 1 bit in `claims` or `header` or wrong domain tag fails closed.
 - **Train bisection teeth**: batch `[good1, bad2, conflict3, good4]` drops `conflict3` at compose (<10 ms), isolates `bad2` via bisection, and lands `good1 + good4` in a clean 2-parent merge chain with zero force-push!
-- **`ast-sweep` benchmark test**: run `landd sweep` read-only against `/Users/ember/pug/fleet-gen3` (`origin/lane/pr7-final-candidate`) on a warm vs cold cache and measure exact wall-clock ms and findings!
+- **`ast-sweep` benchmark test**: run `landd sweep` read-only against `<fleet-checkout>` (`origin/lane/pr7-final-candidate`) on a warm vs cold cache and measure exact wall-clock ms and findings!

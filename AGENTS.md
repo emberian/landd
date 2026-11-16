@@ -2,10 +2,10 @@
 
 1. **Zero macOS Compilation Rule**:
    - **NEVER** execute `cargo`, `rustc`, `lake`, or `lean` locally on macOS.
-   - Run all compilation, clippy, and test commands remotely over SSH on `bb2` using an isolated remote directory (`/tmp/landd-build`) wrapped in `SWARM_MEM_MAX=12G timeout --kill-after=10s 600s`:
+   - Run all compilation, clippy, and test commands remotely over SSH on a designated Linux build host (`BUILD_HOST`) using an isolated remote directory (`/tmp/landd-build`) wrapped in `SWARM_MEM_MAX=12G timeout --kill-after=10s 600s`:
      ```bash
-     rsync -az --delete --exclude target --exclude .git /Users/ember/dev/landd/ bb2:/tmp/landd-build/
-     ssh bb2 'cd /tmp/landd-build && CARGO_TARGET_DIR=/tmp/landd-build/target timeout --kill-after=10s 600s cargo test --workspace'
+     rsync -az --delete --exclude target --exclude .git ./ "$BUILD_HOST":/tmp/landd-build/
+     ssh "$BUILD_HOST" 'cd /tmp/landd-build && CARGO_TARGET_DIR=/tmp/landd-build/target timeout --kill-after=10s 600s cargo test --workspace'
      ```
 2. **Zero Computer-Science Atrocities (TigerStyle)**:
    - **Never** expire content-addressed verdicts by wall-clock age (`BLAKE3`/`SHA-256` over exact input blobs is pure and timeless).

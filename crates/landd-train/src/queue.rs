@@ -7,10 +7,10 @@
 //! start, so lanes survive a restart.
 
 use crate::compose::Candidate;
-use landd_core::{fsx, LandConfig, Oid};
+use landd_core::{fsx, Digest32, LandConfig, Oid};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Whether an idle train should take a batch now. A queue of one leaves at
 /// once: with nobody to share the run with, waiting buys nothing. Two or more
@@ -49,6 +49,13 @@ pub struct Queue {
 }
 
 impl Queue {
+    /// Persistent queues belong to one destination and target ref, even
+    /// when several repositories share a facts/verdict state directory.
+    pub fn path_for(state: &Path, repo_id: &str, target_ref: &str) -> PathBuf {
+        let key = Digest32::tagged("landd daemon queue v1", &[repo_id.as_bytes(), target_ref.as_bytes()]);
+        fsx::shard2(&state.join("queues"), &key.to_hex(), ".json")
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -207,7 +214,7 @@ mod tests {
 
     #[test]
     fn the_queue_survives_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let path = dir.path().join("queue.json");
         assert!(Queue::load(&path).unwrap().is_empty());
         let mut queue = Queue::new();

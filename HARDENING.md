@@ -2,7 +2,7 @@
 
 This file records what two audits of the first version found, what was done about each numbered item, and what was measured afterwards. Pointers are to symbols and test names; inspect those rather than line numbers.
 
-## Verification
+## Initial published build verification
 
 Run on a 32-core Linux build host, Rust 1.99, git 2.47, bubblewrap 0.12:
 
@@ -14,7 +14,7 @@ Run on a 32-core Linux build host, Rust 1.99, git 2.47, bubblewrap 0.12:
 
 Per crate: `landd-core` 73, `ast-sweep` 75, `landd-train` 43, `landd-sim` 12, `landd` 16 (6 unit, 10 end to end). Tests that need a sandbox run `bwrap` for real; nothing is mocked.
 
-## Measured on a real corpus
+## Initial published build measurements
 
 The corpus is a private Python repository ("Fleet") of 4,015 tracked files, 2,438 of them carrying facts, with 1,216 test modules. All figures are at commit `959b02f775cf4348899ee1a9dbad8d9c4d1ac44a`; "previous" is `7609f212e264f158b7ea5585fceb4b98b698d79d`, six commits earlier (64 files changed, 53 of them fact-bearing). The repository's own `gateaudits.json` at that commit was used as the trusted metadata.
 
@@ -33,7 +33,7 @@ Under the default strict model:
 | … contradicted | 1 |
 | … naming a file with no dynamic load | 5 |
 
-**landd reuses no test verdict on this corpus.** Every test imports one shared support module, and that module by itself reads the whole tree, reads through paths the analysis cannot resolve, and starts child processes. Cones widened, by cause (a cone usually has several):
+**The initial build transported no cones on this corpus.** Every test imports one shared support module, and that module by itself reads the whole tree, reads through paths the analysis cannot resolve, and starts child processes. Cones widened, by cause (a cone usually has several):
 
 | cause | cones |
 |---|---:|
@@ -82,11 +82,13 @@ A private projection of the repository's real land ledger was read: the latest d
 | refused attempts inside runs | 60 |
 | landed run wall, p50 / p95 | 563.7 s / 2,119.3 s |
 | landed push phase, p50 / p95 | 341.0 s / 1,135.0 s |
-| first attempt to main, p50 / p95 | 563.2 s / 2,118.8 s |
+| first observed applied attempt to destination confirmation, p50 / p95 | 563.2 s / 2,118.8 s |
 
-Over the full ledger: 2,220 applied runs, 2,102 lanes, 1,493 landed; first attempt to main p50 248.1 s, p95 1,312.3 s. One outcome word (`refused:red-cap`, 63 runs) is not in the classification table and is reported as unclassified rather than guessed. The timing tables hold a wall time for 1,142 modules (4,562 s for one run of each) and 5,567 push records, 3,058 of which carry a module *count* (352,116 module runs in total); they do not say which modules.
+The elapsed-time field is `pushed_ts - min(ts)` grouped by lane tip: source `land/lander.py` records `ts` at applied-run creation and `pushed_ts` after destination confirmation. It is not commit-to-main development lead time; the observation window may omit earlier attempts.
 
-**No saving is claimed.** Every row of the real ledger has `selected: []` and `modules: {}`, so which modules each lane ran is unknown, and `cpu_s` is the hub's CPU for the whole run. `landd replay` therefore reports the replay as unavailable, with those reasons, and reports no CPU or module figure for landd. The discrete-event replay is exercised only on synthetic ledgers that do carry module sets (`landd-sim` tests); that is a test of the model, not evidence about this repository. Combined with the cone result above, the honest statement is that landd as it stands would rerun every test for every candidate on this corpus.
+Over the full ledger: 2,220 applied runs, 2,102 lanes, 1,493 landed; first observed applied attempt to destination confirmation p50 248.1 s, p95 1,312.3 s. One outcome word (`refused:red-cap`, 63 runs) is not in the classification table and is reported as unclassified rather than guessed. The timing tables hold a wall time for 1,142 modules (4,562 s for one run of each) and 5,567 push records, 3,058 of which carry a module *count* (352,116 module runs in total); they do not say which modules.
+
+**No saving is claimed.** Every row of the real ledger has `selected: []` and `modules: {}`, so which modules each lane ran is unknown, and `cpu_s` is the hub's CPU for the whole run. `landd replay` therefore reports the replay as unavailable, with those reasons, and reports no CPU or module figure for landd. The discrete-event replay is exercised only on synthetic ledgers that do carry module sets (`landd-sim` tests); that is a test of the model, not evidence about this repository. The initial build therefore offered no cone-based skip on this corpus. Later static cone comparisons are reported separately below; no actual test-runtime saving has been measured.
 
 ---
 
@@ -152,7 +154,7 @@ Over the full ledger: 2,220 applied runs, 2,102 lanes, 1,493 landed; first attem
 | 15 | Daemon socket open to denial of service | **Fixed.** Connection limit, total deadline, small request frames, buffers that grow with data received. Test: `tooth_slow_and_oversized_clients_are_cut_off`. |
 | 16 | Unsafe daemon lifecycle | **Fixed.** Lock file held for life; only a stale socket is unlinked; mode 0600 and peer-uid check; the listener stops if the train thread dies; the queue is saved on every change. Tests: the daemon end-to-end test, `the_queue_survives_a_restart`. |
 | 17 | Contract gaps against fleet | **Fixed.** No empty merge is pushed (`NoChange`); a lane with nothing to land exits 1 (`OnBase`); `push_no_verify` and `push_env` are settings. Tests: `a_lane_that_changes_nothing_is_not_pushed`, `land_dry_run_apply_decline_and_exit_codes`. |
-| 18 | The replay misreads real ledgers | **Fixed.** Lanes are keyed by `tip`; outcomes go through an explicit table; inner refused attempts are counted; lead time runs from the first attempt; both sides of a replay use the same unit and hub CPU is never compared; input is read as bytes by line. See "Ledger replay" above. Tests: all of `landd-sim`. |
+| 18 | The replay misreads real ledgers | **Fixed.** Lanes are keyed by `tip`; outcomes go through an explicit table; inner refused attempts are counted; elapsed time runs from the first observed applied attempt; both sides of a replay use the same unit and hub CPU is never compared; input is read as bytes by line. See "Ledger replay" above. Tests: all of `landd-sim`. |
 | 19 | Lane text in the commit message | **Fixed.** `valid_lane`; control characters are replaced. Test: `tooth_lane_names_cannot_carry_revision_syntax_or_trailers`. |
 | 20 | Receipts and the hook | **Fixed.** Repository in the subject; `--protect` adds to `refs/heads/main`; the push option size is checked. |
 | 21 | Zombie, kill after reap | **Fixed.** `wait_deadline` kills the group before reaping, and always reaps. |
@@ -168,8 +170,28 @@ Over the full ledger: 2,220 applied runs, 2,102 lanes, 1,493 landed; first attem
 
 ## Known limits
 
-- Static dependency analysis of Python is conservative, not complete. Code that hides a read from the analysis (for example by fetching `open` through `getattr`) is not seen; with `unit_view = "cone"` such a read finds no file.
+- Static dependency analysis recognizes a finite set of Python constructs; it is not a proof of all possible effects. Hidden reads outside the recorded cone cannot reach omitted repository files under a sandboxed cone view. Tree views bind the whole tracked tree. Neither implies that a restricted view preserves a project's original test behavior; that needs actual comparison runs.
 - The sandbox is a namespace sandbox run by the supervisor's own user. It is not a defence against kernel exploits, and what is mounted read-only (`sandbox_ro`) is readable by units.
 - `isolation = "none"` protects nothing and says so.
 - A crash on both base and candidate blocks by default; set `inherit_coarse_failures` to accept that such failures cannot be compared.
 - When two lanes are only red together, the later one is declined.
+
+
+## Takeover hardening
+
+The subsequent implementation combines the independent hardening review with the recovered symbol-analysis work:
+
+- Whole-tree views bind whole-tree verdicts; the cone memo also includes the trusted base. Allowed environment values are snapshotted once for both the profile and execution. Symlink-before-`..` resolution detects mounted key/state aliases.
+- Durable enqueue failures reach the actual Unix client. Newer queued tips survive restart, queues are bound to destination/ref and held by a lifetime writer lock, and nonempty unbound legacy queues are preserved/refused.
+- Trusted state validates directory ancestry, and state inside repository or Git directories is refused before creation. Temporary fixture roots are explicitly private, independent of host umask.
+- Recovered delivery records read fresh destination ancestry before deciding a remembered refusal or re-running a stale-base check. Proven completion overrides local refusal and unread-send states. Tests: `tooth_destination_completion_wins_over_stale_base_and_local_refusals` and `tooth_a_lane_someone_else_carried_is_carried_not_landed`.
+- Network subprocess groups are killed before the leader is reaped, including when the leader exits while a descendant still holds a pipe. Tests: `tooth_exited_network_leaders_do_not_leave_pipe_holders_alive` and `tooth_network_commands_die_at_their_deadline`. Test child guards reap daemons on failure. The receiving hook bounds both input and push-option decoding.
+- Python facts record module initialization and deferred symbol effects separately. Import-time descriptors, subclass hooks and shadowed decorators remain eager; self escaping a constructor conservatively reaches instance methods. Name-based `WeakSet.add(self)` exemptions were removed because a syntactic name does not prove the runtime object is safe.
+
+The physical runner boundary, not universal Python static-analysis completeness, is the safety contract described in SPEC. No deployment or Fleet test-equivalence run is claimed.
+
+### Takeover verification and corpus comparison
+
+On Linux with Rust 1.99, the completed batch passes `cargo test --locked --workspace`: **240 passed, 0 failed**, including actual sandboxed runners, signed receiving hooks, Unix client persistence failures and Git transport child cleanup. Per crate: `ast-sweep` 83, `landd` 22, `landd-core` 76, `landd-sim` 12, `landd-train` 47. `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` are clean. No `landd` process remained after the test run.
+
+A fresh release-build comparison of the same private corpus revisions and rule pack reports **1,216 units: 9 unchanged cone digests, 1,202 changed, 5 added, 0 removed; 1,205 cones still whole-tree**. The scoped analysis removes the blanket dependency on unused support functions in a small subset of units. This is a static comparison only: no real Fleet tests were skipped or timed, no production gate was replaced, and no equivalence between its original and restricted test views was established. The earlier full-tree counts and timings above describe the initial published build, not this implementation. There is still no measured test-runtime saving.

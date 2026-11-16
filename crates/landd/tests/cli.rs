@@ -3,7 +3,7 @@
 use landd_core::custody::{Grant, SigningKey, TrustedKeys};
 use landd_core::digest::hex_encode;
 use landd_core::git::canonical_repo_id;
-use landd_core::git::testkit::Sandbox;
+use landd_core::git::testkit::{ChildGuard, Sandbox};
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -58,7 +58,7 @@ fn write_config(root: &Path, extra: &str) -> PathBuf {
 
 #[test]
 fn sweep_reports_findings_exit_codes_and_a_warm_cache() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = Sandbox::new(
         dir.path(),
         &[
@@ -114,7 +114,7 @@ fn sweep_reports_findings_exit_codes_and_a_warm_cache() {
 
 #[test]
 fn cones_show_changed_transported_and_widened_units() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = Sandbox::new(
         dir.path(),
         &[
@@ -174,7 +174,7 @@ fn cones_show_changed_transported_and_widened_units() {
 
 #[test]
 fn land_dry_run_apply_decline_and_exit_codes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = manifest_repo(dir.path());
     let config = write_config(dir.path(), "");
     let base = sandbox.forge_head(MAIN);
@@ -231,7 +231,7 @@ fn land_dry_run_apply_decline_and_exit_codes() {
 /// The trusted state may not live where a checkout could carry it.
 #[test]
 fn tooth_state_inside_the_repository_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = manifest_repo(dir.path());
     sandbox.lane("good", "main", &[("src/a.txt", "ok good\n")]);
     let inside = format!("cache_dir={}", sandbox.work.join(".landd-cache").display());
@@ -239,9 +239,49 @@ fn tooth_state_inside_the_repository_is_refused() {
         landd(&["land", "--repo", text(&sandbox.work), "--lane", "good", "--set", &inside, "--set", "cone_source=manifest"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("inside the repository"), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(!sandbox.work.join(".landd-cache/verdicts").exists());
+    assert!(!sandbox.work.join(".landd-cache").exists(), "refused inside-repo cache must not be created");
+    // Opening from a subdirectory still catches a cache at the repository root.
+    let from_subdir = landd(&[
+        "land",
+        "--repo",
+        text(&sandbox.work.join("src")),
+        "--lane",
+        "good",
+        "--set",
+        &inside,
+        "--set",
+        "cone_source=manifest",
+    ]);
+    assert_eq!(from_subdir.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&from_subdir.stderr).contains("inside the repository"),
+        "{}",
+        String::from_utf8_lossy(&from_subdir.stderr)
+    );
+    assert!(!sandbox.work.join(".landd-cache").exists());
     let relative = landd(&["land", "--repo", text(&sandbox.work), "--lane", "good", "--set", "cache_dir=.landd-cache"]);
     assert_eq!(relative.status.code(), Some(2));
+}
+
+/// A 0700 state directory under a replaceable ancestor is not trusted state.
+#[test]
+fn tooth_state_under_an_untrusted_ancestor_is_refused_before_admission() {
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
+    let sandbox = manifest_repo(dir.path());
+    sandbox.lane("good", "main", &[("src/a.txt", "ok good\n")]);
+    let base = sandbox.forge_head(MAIN);
+    let parent = dir.path().join("shared");
+    let state = parent.join("private-state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let cache = format!("cache_dir={}", state.display());
+    let out = landd(&["land", "--repo", text(&sandbox.work), "--lane", "good", "--apply", "--set", &cache]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ancestor"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(sandbox.forge_head(MAIN), base);
+    assert!(!state.join("verdicts").exists());
+    assert_eq!(std::fs::metadata(&parent).unwrap().permissions().mode() & 0o7777, 0o777);
 }
 
 fn ctl(socket: &Path, request: &[&str]) -> Value {
@@ -260,7 +300,7 @@ fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
 
 #[test]
 fn daemon_lands_concurrent_enqueues_keeps_bounded_history_and_guards_its_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = manifest_repo(dir.path());
     let config = write_config(dir.path(), "max_batch_size = 8\nsettled_history = 4\n");
     let base = sandbox.forge_head(MAIN);
@@ -274,12 +314,14 @@ fn daemon_lands_concurrent_enqueues_keeps_bounded_history_and_guards_its_socket(
     sandbox.git(&["push", "--quiet", "origin", "three:refs/heads/three"]);
     let socket = dir.path().join("landd.sock");
     let spawn = |socket: &Path| {
-        Command::new(BIN)
-            .args(["daemon", "--socket", text(socket), "--config", text(&config), "--repo", text(&sandbox.work)])
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+        ChildGuard::new(
+            Command::new(BIN)
+                .args(["daemon", "--socket", text(socket), "--config", text(&config), "--repo", text(&sandbox.work)])
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
     };
 
     // Something that is not a socket at the socket path is not deleted.
@@ -289,13 +331,18 @@ fn daemon_lands_concurrent_enqueues_keeps_bounded_history_and_guards_its_socket(
     assert_eq!(refused.status.code(), Some(2));
     assert_eq!(std::fs::read_to_string(&occupied).unwrap(), "keep me");
 
-    let mut daemon = spawn(&socket);
+    let daemon = spawn(&socket);
     wait_for("the daemon's socket", Duration::from_secs(20), || socket.exists());
     assert_eq!(std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
     // A second daemon on the same socket does not take it over.
     let second = spawn(&socket).wait_with_output().unwrap();
     assert_eq!(second.status.code(), Some(2), "{}", String::from_utf8_lossy(&second.stderr));
     assert!(socket.exists());
+    // Another socket must not create a second writer for this destination.
+    let alias_socket = dir.path().join("alias.sock");
+    let duplicate_writer = spawn(&alias_socket).wait_with_output().unwrap();
+    assert_eq!(duplicate_writer.status.code(), Some(2), "{}", String::from_utf8_lossy(&duplicate_writer.stderr));
+    assert!(!alias_socket.exists());
 
     // Four clients at once.
     std::thread::scope(|scope| {
@@ -349,7 +396,8 @@ fn daemon_lands_concurrent_enqueues_keeps_bounded_history_and_guards_its_socket(
         assert_eq!(repo.is_ancestor(tip, &head).unwrap(), *lane != "bad", "{lane}");
     }
     // The saved queue is empty again, and lives in the state directory.
-    let saved: Value = serde_json::from_slice(&std::fs::read(dir.path().join("state/queue.json")).unwrap()).unwrap();
+    let queue_path = landd_train::Queue::path_for(&dir.path().join("state"), &canonical_repo_id(text(&sandbox.forge)), MAIN);
+    let saved: Value = serde_json::from_slice(&std::fs::read(queue_path).unwrap()).unwrap();
     assert_eq!(saved["waiting"], serde_json::json!([]));
 
     assert_eq!(ctl(&socket, &["shutdown"])["reply"], "shutting_down");
@@ -358,21 +406,50 @@ fn daemon_lands_concurrent_enqueues_keeps_bounded_history_and_guards_its_socket(
     assert!(!socket.exists());
 }
 
+/// Dropping a daemon test fixture without calling `shutdown` or `wait` kills
+/// and reaps the child so failed tests never leak background daemons.
+#[test]
+fn tooth_dropped_daemon_guard_kills_and_reaps_the_daemon() {
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
+    let sandbox = manifest_repo(dir.path());
+    let config = write_config(dir.path(), "");
+    let socket = dir.path().join("landd.sock");
+    let pid = {
+        let daemon = ChildGuard::new(
+            Command::new(BIN)
+                .args(["daemon", "--socket", text(&socket), "--config", text(&config), "--repo", text(&sandbox.work)])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        wait_for("the daemon's socket", Duration::from_secs(20), || socket.exists());
+        assert_eq!(ctl(&socket, &["status"])["reply"], "status");
+        daemon.id() as libc::pid_t
+    };
+    // SAFETY: `kill(pid, 0)` probes whether `pid` still exists without sending a signal.
+    let rc = unsafe { libc::kill(pid, 0) };
+    assert_eq!(rc, -1, "dropped daemon pid {pid} must be reaped");
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+}
+
 /// A client that sends its request a byte at a time does not hold a
 /// connection past the daemon's total deadline, and requests are small.
 #[test]
 fn tooth_slow_and_oversized_clients_are_cut_off() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = manifest_repo(dir.path());
     let config = write_config(dir.path(), "request_timeout_s = 1\nmax_connections = 2\n");
     let socket = dir.path().join("landd.sock");
-    let mut daemon = Command::new(BIN)
-        .args(["daemon", "--socket", text(&socket), "--config", text(&config), "--repo", text(&sandbox.work)])
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
+    let daemon = ChildGuard::new(
+        Command::new(BIN)
+            .args(["daemon", "--socket", text(&socket), "--config", text(&config), "--repo", text(&sandbox.work)])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     wait_for("the daemon's socket", Duration::from_secs(20), || socket.exists());
 
     let started = Instant::now();
@@ -402,7 +479,7 @@ fn tooth_slow_and_oversized_clients_are_cut_off() {
 
 #[test]
 fn replay_reports_observed_figures_and_refuses_to_invent_a_replay() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     // A ledger that records module sets and costs can be replayed.
     let ledger = dir.path().join("land_runs.jsonl");
     let row = |ts: u32, tip: &str, outcome: &str| {
@@ -460,7 +537,7 @@ fn replay_reports_observed_figures_and_refuses_to_invent_a_replay() {
 /// a push through landd carries a receipt for this repository and is accepted.
 #[test]
 fn pre_receive_hook_admits_only_receipted_fast_forwards_for_this_repository() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let sandbox = manifest_repo(dir.path());
     let key = SigningKey::ed25519_from_seed([21; 32]);
     let write_key = |name: &str, seed: u8| {
@@ -594,13 +671,13 @@ fn bench_sweep_cold_vs_warm() {
     // With LANDD_BENCH_PREV: warm the cache on an earlier revision, then
     // sweep the benchmark revision. Only blobs that changed are parsed.
     if let Ok(previous) = std::env::var("LANDD_BENCH_PREV") {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = landd_core::git::testkit::private_tempdir().unwrap();
         sweep(&previous, &scratch.path().join("cache"));
         let (next, wall) = sweep(&rev, &scratch.path().join("cache"));
         show(&format!("incremental from {previous}"), &next, wall);
         assert!(next["stats"]["blobs_parsed"].as_u64().unwrap() < next["stats"]["fact_files"].as_u64().unwrap());
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let (cold, cold_wall) = sweep(&rev, &dir.path().join("cache"));
     show("cold", &cold, cold_wall);
     let (warm, warm_wall) = sweep(&rev, &dir.path().join("cache"));
@@ -614,18 +691,20 @@ fn bench_sweep_cold_vs_warm() {
 
 #[test]
 fn a_closed_stdout_pipe_ends_the_process_quietly() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let files: Vec<(String, String)> = (0..300).map(|i| (format!("m{i}.sh"), "python run.py\n".to_owned())).collect();
     let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
     let sandbox = Sandbox::new(dir.path(), &borrowed);
-    let mut child = Command::new(BIN)
-        .args(["sweep", "--repo", text(&sandbox.work), "--no-cache"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = ChildGuard::new(
+        Command::new(BIN)
+            .args(["sweep", "--repo", text(&sandbox.work), "--no-cache"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     // Close the read end before the 300 findings are printed.
-    drop(child.stdout.take());
+    drop(child.inner_mut().stdout.take());
     let out = child.wait_with_output().unwrap();
     assert!(out.status.code().is_some(), "killed by a signal");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"), "{}", String::from_utf8_lossy(&out.stderr));

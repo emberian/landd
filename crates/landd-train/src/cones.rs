@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn manifest_cones_cover_declared_inputs_the_unit_and_the_manifest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &files());
         let repo = sandbox.repo();
         let source = ManifestCones { manifest: "landd-units.json".into() };
@@ -187,7 +187,7 @@ mod tests {
     /// shrink a unit's cone or to make a unit disappear quietly.
     #[test]
     fn tooth_a_candidate_manifest_cannot_weaken_the_bases() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &files());
         let repo = sandbox.repo();
         let source = ManifestCones { manifest: "landd-units.json".into() };
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn python_cones_are_ast_sweep_cones_under_the_operators_pack() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let files = [
             ("lib/__init__.py", ""),
             ("lib/a.py", "A = 1\n"),

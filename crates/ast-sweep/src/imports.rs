@@ -32,6 +32,206 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// How far a name is followed from module to module.
 const MAX_NAME_HOPS: usize = 4;
 
+/// Python 3 standard-library top-level module names (sorted). When no configured
+/// source root explains `import select` or `import inspect`, Python resolves it
+/// from the standard library unless a sibling file in the importer's own
+/// directory shadows it; an unrelated subdirectory file (`land/checks/select.py`)
+/// does not.
+const PYTHON_STDLIB: &[&str] = &[
+    "abc",
+    "antigravity",
+    "argparse",
+    "array",
+    "ast",
+    "asyncio",
+    "atexit",
+    "base64",
+    "bdb",
+    "binascii",
+    "bisect",
+    "builtins",
+    "bz2",
+    "cProfile",
+    "calendar",
+    "cmath",
+    "cmd",
+    "code",
+    "codecs",
+    "codeop",
+    "collections",
+    "colorsys",
+    "compileall",
+    "concurrent",
+    "configparser",
+    "contextlib",
+    "contextvars",
+    "copy",
+    "copyreg",
+    "csv",
+    "ctypes",
+    "curses",
+    "dataclasses",
+    "datetime",
+    "dbm",
+    "decimal",
+    "difflib",
+    "dis",
+    "doctest",
+    "email",
+    "encodings",
+    "ensurepip",
+    "enum",
+    "errno",
+    "faulthandler",
+    "fcntl",
+    "filecmp",
+    "fileinput",
+    "fnmatch",
+    "fractions",
+    "ftplib",
+    "functools",
+    "gc",
+    "genericpath",
+    "getopt",
+    "getpass",
+    "gettext",
+    "glob",
+    "graphlib",
+    "grp",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "idlelib",
+    "imaplib",
+    "importlib",
+    "inspect",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "keyword",
+    "linecache",
+    "locale",
+    "logging",
+    "lzma",
+    "mailbox",
+    "marshal",
+    "math",
+    "mimetypes",
+    "mmap",
+    "modulefinder",
+    "msvcrt",
+    "multiprocessing",
+    "netrc",
+    "nt",
+    "ntpath",
+    "nturl2path",
+    "numbers",
+    "opcode",
+    "operator",
+    "optparse",
+    "os",
+    "pathlib",
+    "pdb",
+    "pickle",
+    "pickletools",
+    "pkgutil",
+    "platform",
+    "plistlib",
+    "poplib",
+    "posix",
+    "posixpath",
+    "pprint",
+    "profile",
+    "pstats",
+    "pty",
+    "pwd",
+    "py_compile",
+    "pyclbr",
+    "pydoc",
+    "pydoc_data",
+    "pyexpat",
+    "queue",
+    "quopri",
+    "random",
+    "re",
+    "readline",
+    "reprlib",
+    "resource",
+    "rlcompleter",
+    "runpy",
+    "sched",
+    "secrets",
+    "select",
+    "selectors",
+    "shelve",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "smtplib",
+    "socket",
+    "socketserver",
+    "sqlite3",
+    "sre_compile",
+    "sre_constants",
+    "sre_parse",
+    "ssl",
+    "stat",
+    "statistics",
+    "string",
+    "stringprep",
+    "struct",
+    "subprocess",
+    "symtable",
+    "sys",
+    "sysconfig",
+    "syslog",
+    "tabnanny",
+    "tarfile",
+    "tempfile",
+    "termios",
+    "textwrap",
+    "this",
+    "threading",
+    "time",
+    "timeit",
+    "tkinter",
+    "token",
+    "tokenize",
+    "tomllib",
+    "trace",
+    "traceback",
+    "tracemalloc",
+    "tty",
+    "turtle",
+    "turtledemo",
+    "types",
+    "typing",
+    "unicodedata",
+    "unittest",
+    "urllib",
+    "uuid",
+    "venv",
+    "warnings",
+    "wave",
+    "weakref",
+    "webbrowser",
+    "winreg",
+    "winsound",
+    "wsgiref",
+    "xml",
+    "xmlrpc",
+    "zipapp",
+    "zipfile",
+    "zipimport",
+    "zlib",
+    "zoneinfo",
+];
+
 /// Why a cone was widened to the whole tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +311,19 @@ struct Link {
     target: LinkTarget,
 }
 
+/// Per-symbol execution states across all files, flattened to `u32` IDs so
+/// cone reachability is a plain integer graph walk.
+#[derive(Debug, Clone, Default)]
+struct ScopeGraph {
+    /// `(top_state, unit_state, all_state)` per file index in `AllFacts::files`.
+    file_states: Vec<(u32, u32, u32)>,
+    /// Owning file index for each state `0..state_edges.len()`.
+    state_file: Vec<u32>,
+    state_edges: Vec<Vec<u32>>,
+    state_reads: Vec<Vec<u32>>,
+    state_causes: Vec<Vec<Cause>>,
+}
+
 /// Nodes are indices into [`AllFacts::files`].
 #[derive(Debug, Clone, Default)]
 pub struct ImportGraph {
@@ -122,6 +335,7 @@ pub struct ImportGraph {
     /// Files a node reads as data.
     reads: Vec<Vec<u32>>,
     causes: Vec<Vec<Cause>>,
+    scopes: ScopeGraph,
     /// Relative imports that name nothing in the tree.
     pub unresolved_relative: Vec<UnresolvedImport>,
     /// Top-level modules imported from outside the tree.
@@ -463,6 +677,7 @@ impl ImportGraph {
             graph.loaders.extend(node.loader);
         }
         graph.loaders.sort_by(|a, b| a.declared.cmp(&b.declared));
+        graph.build_scopes(&context);
         graph
     }
 
@@ -504,12 +719,23 @@ impl ImportGraph {
 
     /// A top-level name that no root explains: any file or package of that
     /// name anywhere in the tree may be what `sys.path` makes it mean.
+    /// Standard-library module names only match a sibling in the importer's
+    /// own directory, never an unrelated subdirectory file across the repo.
     fn loose(&self, context: &Context, importer: u32, module: &str, names: &[String], out: &mut Vec<u32>) -> bool {
         let (top, rest) = module.split_once('.').unwrap_or((module, ""));
+        let stdlib = PYTHON_STDLIB.binary_search(&top).is_ok();
+        let importer_dir = parent(&context.all.files[importer as usize].path);
         let mut found = false;
         for file in context.stems.get(top).into_iter().flatten().filter(|f| **f != importer) {
             let path = context.all.files[*file as usize].path.as_str();
             let package = path.ends_with("/__init__.py").then(|| parent(path));
+            let holder = match package {
+                Some(pkg) => parent(pkg),
+                None => parent(path),
+            };
+            if stdlib && holder != importer_dir {
+                continue;
+            }
             match (rest.is_empty() && names.is_empty(), package) {
                 (true, _) => {
                     out.push(*file);
@@ -529,6 +755,9 @@ impl ImportGraph {
             }
         }
         for dir in context.dirs.get(top).into_iter().flatten() {
+            if stdlib && parent(dir) != importer_dir {
+                continue;
+            }
             found |= self.by_path(context, dir, rest, names, out);
         }
         found
@@ -871,6 +1100,759 @@ impl ImportGraph {
     pub fn edge_count(&self) -> usize {
         self.edges.iter().map(Vec::len).sum()
     }
+
+    fn build_scopes(&mut self, context: &Context) {
+        let count = context.all.files.len();
+        let mut scopes = ScopeGraph { file_states: vec![(0, 0, 0); count], ..ScopeGraph::default() };
+        let alloc = |scopes: &mut ScopeGraph, file: u32| -> u32 {
+            let id = scopes.state_file.len() as u32;
+            scopes.state_file.push(file);
+            scopes.state_edges.push(Vec::new());
+            scopes.state_reads.push(Vec::new());
+            scopes.state_causes.push(Vec::new());
+            id
+        };
+
+        let mut sym_maps: Vec<HashMap<String, u32>> = vec![HashMap::new(); count];
+        let mut int_maps: Vec<HashMap<String, u32>> = vec![HashMap::new(); count];
+        let mut defined_sets: Vec<std::collections::HashSet<&str>> = vec![std::collections::HashSet::new(); count];
+        let mut py_facts: Vec<Option<&FileFacts>> = vec![None; count];
+
+        for (index, file) in context.all.files.iter().enumerate() {
+            let idx = index as u32;
+            if context.link_at.contains_key(&idx) {
+                let top_s = alloc(&mut scopes, idx);
+                let all_s = alloc(&mut scopes, idx);
+                scopes.state_edges[all_s as usize].push(top_s);
+                scopes.file_states[index] = (top_s, all_s, all_s);
+                continue;
+            }
+            let Some(facts) =
+                file.facts.as_deref().filter(|facts| file.kind == Some(FileKind::Python) || facts.language == Language::Python)
+            else {
+                let s = alloc(&mut scopes, idx);
+                scopes.file_states[index] = (s, s, s);
+                continue;
+            };
+            py_facts[index] = Some(facts);
+            defined_sets[index] = facts.defined_symbols.iter().map(String::as_str).collect();
+
+            let mut syms: BTreeSet<&str> = facts.defined_symbols.iter().map(String::as_str).collect();
+            for imp in &facts.imports {
+                if !imp.owner.is_empty() {
+                    syms.insert(&imp.owner);
+                }
+                for (_, local) in &imp.bindings {
+                    if !local.is_empty() && local != "*" {
+                        syms.insert(local);
+                    }
+                }
+            }
+            for site in &facts.reads {
+                if !site.owner.is_empty() {
+                    syms.insert(&site.owner);
+                }
+            }
+            for load in &facts.dynamic_loads {
+                if !load.owner.is_empty() {
+                    syms.insert(&load.owner);
+                }
+            }
+            for (from, to) in &facts.symbol_deps {
+                if !from.is_empty() {
+                    syms.insert(from);
+                }
+                if !to.is_empty() && to != "*" {
+                    syms.insert(to);
+                }
+            }
+            for (from, to, _) in &facts.internal_calls {
+                if !from.is_empty() {
+                    syms.insert(from);
+                }
+                if !to.is_empty() {
+                    syms.insert(to);
+                }
+            }
+            for sref in &facts.external_refs {
+                if !sref.owner.is_empty() {
+                    syms.insert(&sref.owner);
+                }
+            }
+            for (owner, _) in &facts.scoped_calls {
+                if !owner.is_empty() {
+                    syms.insert(owner);
+                }
+            }
+
+            let top_s = alloc(&mut scopes, idx);
+            let mut ext_map = HashMap::with_capacity(syms.len());
+            let mut int_map = HashMap::with_capacity(syms.len());
+            for sym in syms {
+                let int_id = alloc(&mut scopes, idx);
+                let ext_id = alloc(&mut scopes, idx);
+                scopes.state_edges[int_id as usize].push(top_s);
+                scopes.state_edges[ext_id as usize].push(int_id);
+                int_map.insert(sym.to_owned(), int_id);
+                ext_map.insert(sym.to_owned(), ext_id);
+            }
+            let unit_s = alloc(&mut scopes, idx);
+            let all_s = alloc(&mut scopes, idx);
+            scopes.state_edges[unit_s as usize].push(top_s);
+            scopes.state_edges[all_s as usize].push(unit_s);
+            for &ext_id in ext_map.values() {
+                scopes.state_edges[all_s as usize].push(ext_id);
+            }
+            sym_maps[index] = ext_map;
+            int_maps[index] = int_map;
+            scopes.file_states[index] = (top_s, unit_s, all_s);
+        }
+
+        #[allow(clippy::too_many_arguments)] // immutable graph context plus recursive traversal state
+        fn push_sym_states(
+            context: &Context,
+            file_states: &[(u32, u32, u32)],
+            sym_maps: &[HashMap<String, u32>],
+            defined_sets: &[std::collections::HashSet<&str>],
+            target: u32,
+            sym: &str,
+            hops: usize,
+            out: &mut Vec<u32>,
+        ) {
+            if hops > 16 {
+                out.push(file_states[target as usize].2);
+                return;
+            }
+            if let Some(&at) = context.link_at.get(&target) {
+                let (top_s, _, all_s) = file_states[target as usize];
+                out.push(top_s);
+                match &context.links[at].target {
+                    LinkTarget::File(real) => {
+                        push_sym_states(context, file_states, sym_maps, defined_sets, *real, sym, hops + 1, out)
+                    }
+                    LinkTarget::Dir(_) | LinkTarget::Escapes => out.push(all_s),
+                }
+                return;
+            }
+            let (top_s, _, all_s) = file_states[target as usize];
+            if !context.is_python(target) {
+                out.push(top_s);
+                return;
+            }
+            if sym == "*" {
+                out.push(all_s);
+            } else if defined_sets[target as usize].contains(sym) {
+                if let Some(&s_id) = sym_maps[target as usize].get(sym) {
+                    out.push(s_id);
+                } else {
+                    out.push(all_s);
+                }
+            } else {
+                out.push(all_s);
+            }
+        }
+
+        let scope_of = |scopes: &ScopeGraph, sym_maps: &[HashMap<String, u32>], file: usize, owner: &str| -> u32 {
+            if owner.is_empty() {
+                scopes.file_states[file].0
+            } else {
+                sym_maps[file].get(owner).copied().unwrap_or(scopes.file_states[file].0)
+            }
+        };
+
+        let model = context.config.cone_model;
+        let strict = model == ConeModel::Strict;
+
+        for index in 0..count {
+            let idx = index as u32;
+            let (top_s, unit_s, all_s) = scopes.file_states[index];
+            if let Some(&at) = context.link_at.get(&idx) {
+                match &context.links[at].target {
+                    LinkTarget::File(target) => {
+                        scopes.state_edges[top_s as usize].push(scopes.file_states[*target as usize].0);
+                        scopes.state_edges[all_s as usize].push(scopes.file_states[*target as usize].2);
+                    }
+                    LinkTarget::Dir(dir) => {
+                        let mut below = Vec::new();
+                        select_one(&Glob::new(&format!("{dir}/*")), &context.paths, &mut below);
+                        for f in below.iter().copied().filter(|f| context.is_python(*f)) {
+                            scopes.state_edges[top_s as usize].push(scopes.file_states[f as usize].2);
+                        }
+                        scopes.state_reads[top_s as usize].extend(below);
+                    }
+                    LinkTarget::Escapes => scopes.state_causes[top_s as usize].push(Cause::LinkEscape),
+                }
+                continue;
+            }
+            let Some(facts) = py_facts[index] else { continue };
+            if facts.parse_error || facts.truncated {
+                scopes.state_causes[top_s as usize].push(Cause::ParseError);
+            }
+            if facts.too_large {
+                scopes.state_causes[top_s as usize].push(Cause::TooLarge);
+            }
+
+            // Package `__init__.py`s execute their module top-level when any submodule is imported.
+            if let Some((package, _)) = self.names.get(&idx).and_then(|own| own.rsplit_once('.')) {
+                let mut pkg_nodes = Vec::new();
+                self.with_prefixes(package, &mut pkg_nodes);
+                for pkg in pkg_nodes {
+                    if pkg != idx {
+                        scopes.state_edges[top_s as usize].push(scopes.file_states[pkg as usize].0);
+                    }
+                }
+            }
+
+            // Intra-module symbol dependencies.
+            for (from, to) in &facts.symbol_deps {
+                let src = scope_of(&scopes, &int_maps, index, from);
+                if to == "*" {
+                    scopes.state_edges[src as usize].push(all_s);
+                } else if let Some(&dst) = sym_maps[index].get(to.as_str()) {
+                    scopes.state_edges[src as usize].push(dst);
+                }
+            }
+            for (from, to, forwards) in &facts.internal_calls {
+                let src_int = scope_of(&scopes, &int_maps, index, from);
+                if let Some(&dst_int) = int_maps[index].get(to.as_str()) {
+                    scopes.state_edges[src_int as usize].push(dst_int);
+                }
+                if *forwards {
+                    let src_ext = scope_of(&scopes, &sym_maps, index, from);
+                    if let Some(&dst_ext) = sym_maps[index].get(to.as_str()) {
+                        scopes.state_edges[src_ext as usize].push(dst_ext);
+                    }
+                }
+            }
+
+            let mut module_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut symbol_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let import_locals: std::collections::HashSet<&str> =
+                facts.imports.iter().flat_map(|imp| imp.bindings.iter().map(|(_, l)| l.as_str())).collect();
+            let has_own_defs =
+                !facts.functions.is_empty() || facts.defined_symbols.iter().any(|s| !import_locals.contains(s.as_str()));
+
+            for import in &facts.imports {
+                let imp_src = scope_of(&scopes, &int_maps, index, &import.owner);
+                let refs_for = |head: &str| facts.external_refs.iter().filter(move |r| r.head == head).collect::<Vec<_>>();
+
+                if import.level == 0 && import.names.is_empty() {
+                    let mut prefix_nodes = Vec::new();
+                    for (dot, _) in import.module.match_indices('.') {
+                        if let Some(nodes) = self.by_name.get(&import.module[..dot]) {
+                            prefix_nodes.extend(nodes.iter().copied());
+                        }
+                    }
+                    let mod_nodes: Vec<u32> = self.by_name.get(&import.module).cloned().unwrap_or_default();
+                    let mut any_resolved = !prefix_nodes.is_empty() || !mod_nodes.is_empty();
+                    for p in &prefix_nodes {
+                        scopes.state_edges[imp_src as usize].push(scopes.file_states[*p as usize].0);
+                    }
+                    for m in &mod_nodes {
+                        scopes.state_edges[imp_src as usize].push(scopes.file_states[*m as usize].0);
+                    }
+                    if !any_resolved {
+                        let mut loose_nodes = Vec::new();
+                        if self.loose(context, idx, &import.module, &import.names, &mut loose_nodes) {
+                            any_resolved = true;
+                            for ln in loose_nodes {
+                                scopes.state_edges[imp_src as usize].push(scopes.file_states[ln as usize].2);
+                            }
+                        }
+                    }
+                    let _ = any_resolved;
+
+                    if import.bindings.is_empty() {
+                        // `import_module("m")`, `run_module("m")`, `python -m m`.
+                        for m in &mod_nodes {
+                            scopes.state_edges[imp_src as usize].push(scopes.file_states[*m as usize].2);
+                        }
+                    } else {
+                        for (_, bound) in &import.bindings {
+                            if bound.is_empty() {
+                                continue;
+                            }
+                            if import.owner.is_empty() {
+                                module_bound.insert(bound.as_str());
+                            }
+                            let head_of_mod = import.module.split('.').next().unwrap_or("");
+                            let aliased = bound != head_of_mod;
+                            if import.owner.is_empty() {
+                                if let Some(&sym_s) = sym_maps[index].get(bound.as_str()) {
+                                    for m in &mod_nodes {
+                                        scopes.state_edges[sym_s as usize].push(scopes.file_states[*m as usize].2);
+                                    }
+                                    if !aliased {
+                                        for p in &prefix_nodes {
+                                            scopes.state_edges[sym_s as usize].push(scopes.file_states[*p as usize].2);
+                                        }
+                                    }
+                                }
+                            }
+                            let head_refs = refs_for(bound);
+                            if !has_own_defs && head_refs.is_empty() {
+                                let bare_src = if import.owner.is_empty() { unit_s } else { imp_src };
+                                for m in &mod_nodes {
+                                    scopes.state_edges[bare_src as usize].push(scopes.file_states[*m as usize].2);
+                                }
+                            }
+                            for sref in head_refs {
+                                let r_src = scope_of(&scopes, &int_maps, index, &sref.owner);
+                                if aliased {
+                                    if sref.dotted == *bound {
+                                        for m in &mod_nodes {
+                                            scopes.state_edges[r_src as usize].push(scopes.file_states[*m as usize].2);
+                                        }
+                                    } else if let Some(rest) = sref.dotted.strip_prefix(&format!("{bound}.")) {
+                                        let attr = rest.split('.').next().unwrap_or("");
+                                        for m in &mod_nodes {
+                                            push_sym_states(
+                                                context,
+                                                &scopes.file_states,
+                                                &sym_maps,
+                                                &defined_sets,
+                                                *m,
+                                                attr,
+                                                0,
+                                                &mut scopes.state_edges[r_src as usize],
+                                            );
+                                        }
+                                    }
+                                } else if sref.dotted == import.module {
+                                    for m in &mod_nodes {
+                                        scopes.state_edges[r_src as usize].push(scopes.file_states[*m as usize].2);
+                                    }
+                                } else if import.module.starts_with(&format!("{}.", sref.dotted)) {
+                                    for m in &mod_nodes {
+                                        scopes.state_edges[r_src as usize].push(scopes.file_states[*m as usize].2);
+                                    }
+                                    if let Some(p_nodes) = self.by_name.get(&sref.dotted) {
+                                        for p in p_nodes {
+                                            scopes.state_edges[r_src as usize].push(scopes.file_states[*p as usize].2);
+                                        }
+                                    }
+                                } else if let Some(rest) = sref.dotted.strip_prefix(&format!("{}.", import.module)) {
+                                    let attr = rest.split('.').next().unwrap_or("");
+                                    if !self.by_name.contains_key(&format!("{}.{attr}", import.module)) {
+                                        for m in &mod_nodes {
+                                            push_sym_states(
+                                                context,
+                                                &scopes.file_states,
+                                                &sym_maps,
+                                                &defined_sets,
+                                                *m,
+                                                attr,
+                                                0,
+                                                &mut scopes.state_edges[r_src as usize],
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // Access on a package prefix, e.g. `import a.b.c; a.helper()`.
+                                    for (dot, _) in import.module.match_indices('.') {
+                                        let pkg_prefix = &import.module[..dot];
+                                        if let Some(rest) = sref.dotted.strip_prefix(&format!("{pkg_prefix}.")) {
+                                            let attr = rest.split('.').next().unwrap_or("");
+                                            if !self.by_name.contains_key(&format!("{pkg_prefix}.{attr}")) {
+                                                if let Some(p_nodes) = self.by_name.get(pkg_prefix) {
+                                                    for p in p_nodes {
+                                                        push_sym_states(
+                                                            context,
+                                                            &scopes.file_states,
+                                                            &sym_maps,
+                                                            &defined_sets,
+                                                            *p,
+                                                            attr,
+                                                            0,
+                                                            &mut scopes.state_edges[r_src as usize],
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // `from ... import ...` (absolute or relative), or bare relative.
+                let mut prefix_nodes = Vec::new();
+                let mut mod_nodes = Vec::new();
+                let mut rel_base_dir: Option<String> = None;
+                let mut resolved_any = false;
+
+                if import.level == 0 {
+                    for (dot, _) in import.module.match_indices('.') {
+                        if let Some(nodes) = self.by_name.get(&import.module[..dot]) {
+                            prefix_nodes.extend(nodes.iter().copied());
+                            resolved_any = true;
+                        }
+                    }
+                    if let Some(nodes) = self.by_name.get(&import.module) {
+                        mod_nodes.extend(nodes.iter().copied());
+                        resolved_any = true;
+                    }
+                } else {
+                    let mut dir = Some(parent(&context.all.files[index].path));
+                    for _ in 1..import.level {
+                        dir = dir.filter(|d| !d.is_empty()).map(parent);
+                    }
+                    if let Some(dir) = dir {
+                        let mut here = dir.to_owned();
+                        let segments: Vec<&str> = import.module.split('.').filter(|s| !s.is_empty()).collect();
+                        for (at, segment) in segments.iter().enumerate() {
+                            let next = join(&here, segment);
+                            if at + 1 < segments.len() {
+                                resolved_any |= context.lookup(&format!("{next}/__init__.py"), &mut prefix_nodes);
+                            } else {
+                                resolved_any |= context.lookup(&format!("{next}/__init__.py"), &mut mod_nodes);
+                                resolved_any |= context.lookup(&format!("{next}.py"), &mut mod_nodes);
+                            }
+                            here = next;
+                        }
+                        if segments.is_empty() {
+                            resolved_any |= context.lookup(&join(&here, "__init__.py"), &mut mod_nodes);
+                        }
+                        rel_base_dir = Some(here);
+                    }
+                }
+
+                for p in &prefix_nodes {
+                    scopes.state_edges[imp_src as usize].push(scopes.file_states[*p as usize].0);
+                }
+                for m in &mod_nodes {
+                    scopes.state_edges[imp_src as usize].push(scopes.file_states[*m as usize].0);
+                }
+
+                if import.names.iter().any(|n| n == "*") {
+                    for m in &mod_nodes {
+                        scopes.state_edges[imp_src as usize].push(scopes.file_states[*m as usize].2);
+                    }
+                }
+
+                if import.bindings.is_empty() {
+                    // `__import__('x', fromlist=['y'])`
+                    for name in import.names.iter().filter(|n| *n != "*") {
+                        let mut sub_nodes = Vec::new();
+                        if import.level == 0 {
+                            if let Some(nodes) = self.by_name.get(&format!("{}.{name}", import.module)) {
+                                sub_nodes.extend(nodes.iter().copied());
+                                resolved_any = true;
+                            }
+                        } else if let Some(here) = &rel_base_dir {
+                            let base = join(here, name);
+                            resolved_any |= context.lookup(&format!("{base}.py"), &mut sub_nodes);
+                            resolved_any |= context.lookup(&format!("{base}/__init__.py"), &mut sub_nodes);
+                        }
+                        for sub in &sub_nodes {
+                            scopes.state_edges[imp_src as usize].push(scopes.file_states[*sub as usize].2);
+                        }
+                        if sub_nodes.is_empty() {
+                            for m in &mod_nodes {
+                                push_sym_states(
+                                    context,
+                                    &scopes.file_states,
+                                    &sym_maps,
+                                    &defined_sets,
+                                    *m,
+                                    name,
+                                    0,
+                                    &mut scopes.state_edges[imp_src as usize],
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    for (orig, local) in &import.bindings {
+                        if orig == "*" || local.is_empty() {
+                            continue;
+                        }
+                        let mut sub_nodes = Vec::new();
+                        if import.level == 0 {
+                            if let Some(nodes) = self.by_name.get(&format!("{}.{orig}", import.module)) {
+                                sub_nodes.extend(nodes.iter().copied());
+                                resolved_any = true;
+                            }
+                        } else if let Some(here) = &rel_base_dir {
+                            let base = join(here, orig);
+                            resolved_any |= context.lookup(&format!("{base}.py"), &mut sub_nodes);
+                            resolved_any |= context.lookup(&format!("{base}/__init__.py"), &mut sub_nodes);
+                        }
+
+                        if !sub_nodes.is_empty() {
+                            if import.owner.is_empty() {
+                                module_bound.insert(local.as_str());
+                                if let Some(&sym_s) = sym_maps[index].get(local.as_str()) {
+                                    for sub in &sub_nodes {
+                                        scopes.state_edges[sym_s as usize].push(scopes.file_states[*sub as usize].2);
+                                    }
+                                }
+                            }
+                            for sub in &sub_nodes {
+                                scopes.state_edges[imp_src as usize].push(scopes.file_states[*sub as usize].0);
+                            }
+                            // If the package `__init__.py` also explicitly defines `orig`, link it.
+                            for m in &mod_nodes {
+                                if defined_sets[*m as usize].contains(orig.as_str()) {
+                                    if import.owner.is_empty() {
+                                        if let Some(&sym_s) = sym_maps[index].get(local.as_str()) {
+                                            push_sym_states(
+                                                context,
+                                                &scopes.file_states,
+                                                &sym_maps,
+                                                &defined_sets,
+                                                *m,
+                                                orig,
+                                                0,
+                                                &mut scopes.state_edges[sym_s as usize],
+                                            );
+                                        }
+                                    } else {
+                                        push_sym_states(
+                                            context,
+                                            &scopes.file_states,
+                                            &sym_maps,
+                                            &defined_sets,
+                                            *m,
+                                            orig,
+                                            0,
+                                            &mut scopes.state_edges[imp_src as usize],
+                                        );
+                                    }
+                                }
+                            }
+                            let head_refs = refs_for(local);
+                            if !has_own_defs && head_refs.is_empty() {
+                                let bare_src = if import.owner.is_empty() { unit_s } else { imp_src };
+                                for sub in &sub_nodes {
+                                    scopes.state_edges[bare_src as usize].push(scopes.file_states[*sub as usize].2);
+                                }
+                            }
+                            for sref in head_refs {
+                                let r_src = scope_of(&scopes, &int_maps, index, &sref.owner);
+                                if sref.dotted == *local {
+                                    for sub in &sub_nodes {
+                                        scopes.state_edges[r_src as usize].push(scopes.file_states[*sub as usize].2);
+                                    }
+                                } else if let Some(rest) = sref.dotted.strip_prefix(&format!("{local}.")) {
+                                    let attr = rest.split('.').next().unwrap_or("");
+                                    for sub in &sub_nodes {
+                                        push_sym_states(
+                                            context,
+                                            &scopes.file_states,
+                                            &sym_maps,
+                                            &defined_sets,
+                                            *sub,
+                                            attr,
+                                            0,
+                                            &mut scopes.state_edges[r_src as usize],
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            if import.owner.is_empty() {
+                                symbol_bound.insert(local.as_str());
+                                if let Some(&sym_s) = sym_maps[index].get(local.as_str()) {
+                                    for m in &mod_nodes {
+                                        push_sym_states(
+                                            context,
+                                            &scopes.file_states,
+                                            &sym_maps,
+                                            &defined_sets,
+                                            *m,
+                                            orig,
+                                            0,
+                                            &mut scopes.state_edges[sym_s as usize],
+                                        );
+                                    }
+                                }
+                            } else {
+                                for m in &mod_nodes {
+                                    push_sym_states(
+                                        context,
+                                        &scopes.file_states,
+                                        &sym_maps,
+                                        &defined_sets,
+                                        *m,
+                                        orig,
+                                        0,
+                                        &mut scopes.state_edges[imp_src as usize],
+                                    );
+                                }
+                            }
+                            for sref in refs_for(local) {
+                                let r_src = scope_of(&scopes, &int_maps, index, &sref.owner);
+                                for m in &mod_nodes {
+                                    push_sym_states(
+                                        context,
+                                        &scopes.file_states,
+                                        &sym_maps,
+                                        &defined_sets,
+                                        *m,
+                                        orig,
+                                        0,
+                                        &mut scopes.state_edges[r_src as usize],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !resolved_any {
+                    if import.level == 0 {
+                        let mut loose_nodes = Vec::new();
+                        if self.loose(context, idx, &import.module, &import.names, &mut loose_nodes) {
+                            for ln in loose_nodes {
+                                scopes.state_edges[imp_src as usize].push(scopes.file_states[ln as usize].2);
+                            }
+                        }
+                    } else {
+                        scopes.state_causes[imp_src as usize].push(Cause::UnresolvedRelativeImport);
+                    }
+                }
+            }
+
+            // Connect `unit_s` to all non-module-only symbol states in this file.
+            let fn_heads: std::collections::HashSet<&str> =
+                facts.functions.iter().filter_map(|f| f.name.split('.').next()).collect();
+            for (sym_name, &sym_s) in &sym_maps[index] {
+                let pure_module = module_bound.contains(sym_name.as_str())
+                    && !symbol_bound.contains(sym_name.as_str())
+                    && !fn_heads.contains(sym_name.as_str());
+                if !pure_module {
+                    scopes.state_edges[unit_s as usize].push(sym_s);
+                }
+            }
+
+            // Declared and undeclared dynamic loaders, scoped to the owning symbol.
+            let declaration = context.declared.get(&idx);
+            let mut bounded_loader = false;
+            if let Some((_, patterns)) = declaration {
+                let (status, _) = self.verify_loader(context, idx, facts, patterns);
+                bounded_loader = status == LoaderStatus::Verified
+                    || (status == LoaderStatus::Unverifiable && context.config.unverified_loaders == UnverifiedLoaders::Trust);
+                let mut decl_causes = Vec::new();
+                match status {
+                    LoaderStatus::Contradicted => decl_causes.push(Cause::ContradictedLoader),
+                    LoaderStatus::Unverifiable if !bounded_loader => decl_causes.push(Cause::UnverifiedLoader),
+                    _ => {}
+                }
+                let mut loaded = Vec::new();
+                if bounded_loader && context.select(patterns, false, &mut loaded, &mut decl_causes) {
+                    decl_causes.push(Cause::WholeTreeRead);
+                }
+                let loader_owners = facts
+                    .dynamic_loads
+                    .iter()
+                    .map(|l| l.owner.as_str())
+                    .chain(facts.reads.iter().filter(|s| s.shape == ReadShape::Module).map(|s| s.owner.as_str()));
+                for owner in loader_owners {
+                    let l_src = scope_of(&scopes, &int_maps, index, owner);
+                    scopes.state_causes[l_src as usize].extend(decl_causes.iter().copied());
+                    if bounded_loader {
+                        for f in loaded.iter().copied().filter(|f| context.is_python(*f)) {
+                            scopes.state_edges[l_src as usize].push(scopes.file_states[f as usize].2);
+                        }
+                        scopes.state_reads[l_src as usize].extend(loaded.iter().copied());
+                    }
+                }
+            }
+
+            for load in &facts.dynamic_loads {
+                let hides_scan = load.what.starts_with("pkgutil.") || load.what.starts_with("wildcard import");
+                if !bounded_loader && declaration.is_none() && (strict || hides_scan) {
+                    let l_src = scope_of(&scopes, &int_maps, index, &load.owner);
+                    scopes.state_causes[l_src as usize].push(Cause::DynamicLoad);
+                }
+            }
+
+            for site in &facts.reads {
+                let s_src = scope_of(&scopes, &int_maps, index, &site.owner);
+                let s_ext = scope_of(&scopes, &sym_maps, index, &site.owner);
+                let loads_code = site.shape == ReadShape::Module;
+                if loads_code && bounded_loader {
+                    let resolved = self.resolve(context, idx, &site.reach, 0);
+                    for (base, _) in resolved.bases.into_iter().filter(|(_, open)| !open) {
+                        let mut targets = Vec::new();
+                        context.lookup(&base, &mut targets);
+                        for t in targets {
+                            scopes.state_edges[s_src as usize].push(scopes.file_states[t as usize].2);
+                        }
+                    }
+                    continue;
+                }
+                if site.shape == ReadShape::Process {
+                    if strict {
+                        scopes.state_causes[s_src as usize].push(Cause::Process);
+                    }
+                    continue;
+                }
+                let unbounded = if loads_code { Cause::UnresolvedLoad } else { Cause::UnresolvedRead };
+                let resolved = self.resolve(context, idx, &site.reach, 0);
+                if resolved.unknown {
+                    scopes.state_causes[s_src as usize].push(unbounded);
+                }
+                if resolved.opaque && strict {
+                    let cause = if loads_code { Cause::UnresolvedLoad } else { Cause::OpaqueRead };
+                    if site.internal_clean {
+                        let clean_reach = Reach { places: site.reach.places.clone(), unknown: site.reach.unknown, opaque: false };
+                        let res_int = self.resolve(context, idx, &clean_reach, 0);
+                        if res_int.opaque {
+                            scopes.state_causes[s_src as usize].push(cause);
+                        } else {
+                            scopes.state_causes[s_ext as usize].push(cause);
+                        }
+                    } else {
+                        scopes.state_causes[s_src as usize].push(cause);
+                    }
+                }
+                for (base, open) in &resolved.bases {
+                    let Some(patterns) = site_patterns(&site.shape, base, *open, model) else {
+                        scopes.state_causes[s_src as usize].push(unbounded);
+                        continue;
+                    };
+                    let mut selected = Vec::new();
+                    if context.select(&patterns, true, &mut selected, &mut scopes.state_causes[s_src as usize]) {
+                        scopes.state_causes[s_src as usize].push(Cause::WholeTreeRead);
+                    }
+                    if loads_code {
+                        for f in selected.iter().copied().filter(|f| context.is_python(*f)) {
+                            scopes.state_edges[s_src as usize].push(scopes.file_states[f as usize].2);
+                        }
+                    }
+                    scopes.state_reads[s_src as usize].extend(selected);
+                }
+            }
+
+            if !context.whole_calls.is_empty() {
+                for (owner, callee) in &facts.scoped_calls {
+                    if context.whole_calls.matches(callee) {
+                        let c_src = scope_of(&scopes, &int_maps, index, owner);
+                        scopes.state_causes[c_src as usize].push(Cause::WholeTreeCall);
+                    }
+                }
+            }
+        }
+
+        for edges in &mut scopes.state_edges {
+            edges.sort_unstable();
+            edges.dedup();
+        }
+        for reads in &mut scopes.state_reads {
+            reads.sort_unstable();
+            reads.dedup();
+        }
+        for causes in &mut scopes.state_causes {
+            causes.sort_unstable();
+            causes.dedup();
+        }
+        self.scopes = scopes;
+    }
 }
 
 /// One test unit's cone.
@@ -937,40 +1919,49 @@ pub fn cones(all: &AllFacts, graph: &ImportGraph, config: &ImportConfig, context
         })
         .collect();
 
+    let state_count = graph.scopes.state_file.len();
     light_pool().install(|| {
         tests
             .par_iter()
             .map_init(
-                || (vec![false; all.files.len()], Vec::<u32>::new()),
-                |(seen, stack), test| {
+                || (vec![false; state_count], vec![false; all.files.len()], Vec::<u32>::new()),
+                |(seen_state, seen_file, stack), test| {
                     let path = all.files[*test as usize].path.as_str();
                     let unit = graph.module_of(*test).unwrap_or(path).to_owned();
                     stack.clear();
-                    stack.push(*test);
+                    stack.push(graph.scopes.file_states[*test as usize].1);
                     if config.implicit_conftest {
                         let mut dir = path;
                         loop {
                             dir = parent(dir);
                             if let Some(index) = all.index_of(&join(dir, "conftest.py")) {
-                                stack.push(index as u32);
+                                stack.push(graph.scopes.file_states[index].1);
                             }
                             if dir.is_empty() {
                                 break;
                             }
                         }
                     }
+                    let mut visited_states = Vec::new();
                     let mut closure = Vec::new();
                     let mut causes = Vec::new();
-                    while let Some(node) = stack.pop() {
-                        if std::mem::replace(&mut seen[node as usize], true) {
+                    while let Some(state) = stack.pop() {
+                        if std::mem::replace(&mut seen_state[state as usize], true) {
                             continue;
                         }
-                        closure.push(node);
-                        causes.extend(graph.causes[node as usize].iter().map(|cause| (node, *cause)));
-                        stack.extend(graph.edges[node as usize].iter().filter(|n| !seen[**n as usize]));
+                        visited_states.push(state);
+                        let node = graph.scopes.state_file[state as usize];
+                        if !std::mem::replace(&mut seen_file[node as usize], true) {
+                            closure.push(node);
+                        }
+                        causes.extend(graph.scopes.state_causes[state as usize].iter().map(|cause| (node, *cause)));
+                        stack.extend(graph.scopes.state_edges[state as usize].iter().filter(|s| !seen_state[**s as usize]));
                     }
-                    for node in &closure {
-                        seen[*node as usize] = false;
+                    for &s in &visited_states {
+                        seen_state[s as usize] = false;
+                    }
+                    for &node in &closure {
+                        seen_file[node as usize] = false;
                     }
                     let imported_files = closure.len();
                     let mut inputs = closure.clone();
@@ -986,8 +1977,8 @@ pub fn cones(all: &AllFacts, graph: &ImportGraph, config: &ImportConfig, context
                     let inputs = if widened {
                         everything.clone()
                     } else {
-                        for node in &closure {
-                            inputs.extend(&graph.reads[*node as usize]);
+                        for &s in &visited_states {
+                            inputs.extend(&graph.scopes.state_reads[s as usize]);
                         }
                         inputs.extend(&always);
                         inputs.sort_unstable();
@@ -1596,5 +2587,247 @@ mod tests {
         let listed = ImportConfig { whole_tree_calls: vec!["census.census".into()], ..config() };
         let (all, cones) = cones_of(&with(&tree, &[]), &listed);
         assert_eq!(causes(&all, &cones[0]), [("tests/test_census.py".to_owned(), Cause::WholeTreeCall)]);
+    }
+
+    #[test]
+    fn tooth_symbol_imports_ignore_unrelated_whole_tree_helpers_and_lazy_package_hooks() {
+        let tree = [
+            (
+                "tests/__init__.py",
+                "import os\ndef load_tests(loader, standard, pattern):\n    from tests import support\n    return support.guard(standard)\n",
+            ),
+            (
+                "tests/support.py",
+                "import json, os, subprocess\n\
+                 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n\
+                 def pure_slug(s):\n    return s.strip().lower()\n\
+                 def catalog():\n    with open(os.path.join(REPO, 'data', 'defaults.json')) as f:\n        return json.load(f)\n\
+                 def probe_bus():\n    return subprocess.run(['systemctl', '--user', 'status'])\n\
+                 def walk_all():\n    return list(os.walk(REPO))\n\
+                 NEED_PROBES = {'bus': probe_bus}\n\
+                 def guard(suite):\n    NEED_PROBES['bus']()\n    return suite\n",
+            ),
+            ("data/defaults.json", "{\"ok\": true}\n"),
+            ("docs/unrelated.md", "notes\n"),
+            ("tests/test_pure.py", "from tests.support import pure_slug\ndef test():\n    assert pure_slug(' A ') == 'a'\n"),
+            ("tests/test_catalog.py", "from tests import support\ndef test():\n    assert support.catalog()['ok']\n"),
+            ("tests/test_guard.py", "from tests.support import guard\ndef test():\n    guard(None)\n"),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        let pure = cone(&cones, "tests.test_pure");
+        assert!(!pure.widened, "{:?}", causes(&all, pure));
+        assert_eq!(inputs(&all, pure), ["tests/__init__.py", "tests/support.py", "tests/test_pure.py"]);
+
+        let cat = cone(&cones, "tests.test_catalog");
+        assert!(!cat.widened, "{:?}", causes(&all, cat));
+        assert_eq!(inputs(&all, cat), ["data/defaults.json", "tests/__init__.py", "tests/support.py", "tests/test_catalog.py"]);
+
+        let guarded = cone(&cones, "tests.test_guard");
+        assert!(guarded.widened);
+        assert_eq!(causes(&all, guarded), [("tests/support.py".to_owned(), Cause::Process)]);
+    }
+
+    #[test]
+    fn tooth_top_level_class_body_and_default_arg_io_still_taint_every_import() {
+        let tree = [
+            ("mod_top.py", "import os\nPURE = 1\nlist(os.walk('.'))\n"),
+            ("mod_def.py", "import os\nPURE = 1\ndef unused(x=open(os.environ['SECRET'])):\n    return x\n"),
+            ("mod_cls.py", "import subprocess\nPURE = 1\nclass Unused:\n    RAN = subprocess.run(['git', 'status'])\n"),
+            ("tests/test_top.py", "from mod_top import PURE\nassert PURE == 1\n"),
+            ("tests/test_def.py", "from mod_def import PURE\nassert PURE == 1\n"),
+            ("tests/test_cls.py", "from mod_cls import PURE\nassert PURE == 1\n"),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        assert_eq!(causes(&all, cone(&cones, "tests.test_top")), [("mod_top.py".to_owned(), Cause::WholeTreeRead)]);
+        assert_eq!(causes(&all, cone(&cones, "tests.test_def")), [("mod_def.py".to_owned(), Cause::UnresolvedRead)]);
+        assert_eq!(causes(&all, cone(&cones, "tests.test_cls")), [("mod_cls.py".to_owned(), Cause::Process)]);
+    }
+
+    #[test]
+    fn tooth_transitive_internal_helpers_and_parameter_forwarding_stay_sound() {
+        let tree = [
+            (
+                "lib/catalog.py",
+                "import json, os\n\
+                 HERE = os.path.dirname(os.path.abspath(__file__))\n\
+                 def _load_keys(path):\n    with open(path) as f:\n        return json.load(f)\n\
+                 def shipped_default(key, product='fleet'):\n\
+                     name = 'a.json' if product == 'fleet' else 'b.json'\n\
+                     return _load_keys(os.path.join(HERE, name)).get(key)\n\
+                 def forward_user_path(custom):\n    return _load_keys(custom)\n",
+            ),
+            ("lib/__init__.py", ""),
+            ("lib/a.json", "{}\n"),
+            ("lib/b.json", "{}\n"),
+            ("lib/unrelated.json", "{}\n"),
+            ("tests/test_shipped.py", "from lib.catalog import shipped_default\ndef test():\n    shipped_default('k')\n"),
+            ("tests/test_private.py", "from lib.catalog import _load_keys\ndef test(p):\n    _load_keys('lib/a.json')\n"),
+            (
+                "tests/test_forward.py",
+                "from lib.catalog import forward_user_path\ndef test():\n    forward_user_path('lib/a.json')\n",
+            ),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        let shipped = cone(&cones, "tests.test_shipped");
+        assert!(!shipped.widened, "{:?}", causes(&all, shipped));
+        assert_eq!(
+            inputs(&all, shipped),
+            ["lib/__init__.py", "lib/a.json", "lib/b.json", "lib/catalog.py", "tests/test_shipped.py"]
+        );
+
+        assert_eq!(causes(&all, cone(&cones, "tests.test_private")), [("lib/catalog.py".to_owned(), Cause::OpaqueRead)]);
+        assert_eq!(causes(&all, cone(&cones, "tests.test_forward")), [("lib/catalog.py".to_owned(), Cause::OpaqueRead)]);
+    }
+
+    #[test]
+    fn tooth_dynamic_introspection_wildcards_bare_modules_and_decorators_fall_back_soundly() {
+        let tree = [
+            ("lib/__init__.py", ""),
+            (
+                "lib/helpers.py",
+                "import subprocess\n\
+                 class LazyRe:\n    def __getattr__(self, name):\n        return name\n\
+                 def clean():\n    return LazyRe()\n\
+                 def dirty():\n    subprocess.run(['id'])\n\
+                 def via_globals(k):\n    return globals()[k]()\n\
+                 def via_vars(k):\n    return vars()[k]()\n",
+            ),
+            (
+                "lib/decorated.py",
+                "import subprocess\n\
+                 PURE = 1\n\
+                 def register(fn):\n    fn()\n    return fn\n\
+                 @register\n\
+                 def eager():\n    subprocess.run(['id'])\n",
+            ),
+            (
+                "lib/pep562.py",
+                "import subprocess\n\
+                 PURE = 1\n\
+                 def __getattr__(name):\n    subprocess.run(['id'])\n    return 1\n",
+            ),
+            ("tests/test_clean.py", "from lib.helpers import clean\ndef test():\n    clean()\n"),
+            ("tests/test_bare.py", "from lib import helpers\ndef patch(m):\n    return m\ndef test():\n    patch(helpers)\n"),
+            ("tests/test_star.py", "from lib.helpers import *\ndef test():\n    clean()\n"),
+            ("tests/test_globals.py", "from lib.helpers import via_globals\ndef test():\n    via_globals('clean')\n"),
+            ("tests/test_vars.py", "from lib.helpers import via_vars\ndef test():\n    via_vars('clean')\n"),
+            ("tests/test_decorated.py", "from lib.decorated import PURE\nassert PURE == 1\n"),
+            ("tests/test_pep562.py", "from lib.pep562 import PURE\nassert PURE == 1\n"),
+        ];
+        let (_, cones) = cones_of(&with(&tree, &[]), &config());
+        assert!(!cone(&cones, "tests.test_clean").widened);
+        for widened_unit in [
+            "tests.test_bare",
+            "tests.test_star",
+            "tests.test_globals",
+            "tests.test_vars",
+            "tests.test_decorated",
+            "tests.test_pep562",
+        ] {
+            assert!(cone(&cones, widened_unit).widened, "{widened_unit} must fall back to widened");
+        }
+    }
+
+    #[test]
+    fn tooth_reexports_and_plain_singleton_construction_stay_narrow_unless_init_touches_state() {
+        let tree = [
+            ("pkg/__init__.py", "from .clean import Clean\nfrom .dirty import Dirty\n"),
+            ("pkg/clean.py", "class Clean:\n    pass\n"),
+            ("pkg/dirty.py", "import subprocess\nclass Dirty:\n    def run(self):\n        subprocess.run(['id'])\n"),
+            (
+                "pkg/watched.py",
+                "import os, weakref\n\
+                 _WATCHERS = weakref.WeakSet()\n\
+                 class Watched:\n\
+                     def __init__(self):\n\
+                         self.fd = -1\n\
+                         _WATCHERS.add(self)\n\
+                     def sweep(self, p):\n\
+                         return os.stat(p)\n\
+                 WATCHED = Watched()\n\
+                 def pure():\n    return 42\n",
+            ),
+            (
+                "pkg/eager_cls.py",
+                "import os\n\
+                 class Eager:\n\
+                     def __init__(self):\n\
+                         self.sweep('x')\n\
+                     def sweep(self, p):\n\
+                         return os.stat(p)\n\
+                 EAGER = Eager()\n\
+                 def pure():\n    return 1\n",
+            ),
+            ("tests/test_reexport.py", "from pkg import Clean\ndef test():\n    Clean()\n"),
+            ("pkg/plain.py", "class Plain:\n    def __init__(self):\n        self.fd = -1\n    def read(self, p):\n        return open(p).read()\nINSTANCE = Plain()\ndef pure():\n    return 1\n"),
+            ("pkg/hooks.py", "class Hooked:\n    def __init__(self):\n        self.fd = -1\n    def __setattr__(self, name, value):\n        open('hidden.txt').read()\nINSTANCE = Hooked()\ndef pure():\n    return 1\n"),
+            ("hidden.txt", "hello\n"),
+            ("tests/test_plain.py", "from pkg.plain import pure\npure()\n"),
+            ("tests/test_hooks.py", "from pkg.hooks import pure\npure()\n"),
+            ("tests/test_watched_pure.py", "from pkg.watched import pure\ndef test():\n    assert pure() == 42\n"),
+            ("tests/test_watched_use.py", "from pkg.watched import WATCHED\ndef test(p):\n    WATCHED.sweep(p)\n"),
+            ("tests/test_eager_cls.py", "from pkg.eager_cls import pure\ndef test():\n    pure()\n"),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        let reexp = cone(&cones, "tests.test_reexport");
+        assert!(!reexp.widened, "{:?}", causes(&all, reexp));
+        assert_eq!(inputs(&all, reexp), ["pkg/__init__.py", "pkg/clean.py", "pkg/dirty.py", "tests/test_reexport.py"]);
+
+        assert!(!cone(&cones, "tests.test_plain").widened);
+        assert!(inputs(&all, cone(&cones, "tests.test_hooks")).contains(&"hidden.txt"));
+        let wpure = cone(&cones, "tests.test_watched_pure");
+        assert!(wpure.widened, "escaping self must conservatively include instance methods");
+        assert!(cone(&cones, "tests.test_watched_use").widened);
+        assert!(cone(&cones, "tests.test_eager_cls").widened);
+    }
+
+    #[test]
+    fn tooth_attribute_reads_and_subclass_hooks_execute_at_import_time() {
+        let tree = [
+            ("data/descriptor.txt", "a"),
+            ("data/subclass.txt", "b"),
+            ("descriptors.py", "class Holder:\n    @property\n    def data(self):\n        return open('data/descriptor.txt').read()\nobj = Holder()\nVALUE = obj.data\nPURE = 1\n"),
+            ("subclasses.py", "class Base:\n    def __init_subclass__(cls):\n        open('data/subclass.txt').read()\nclass Child(Base):\n    pass\nPURE = 1\n"),
+            ("tests/test_descriptor.py", "from descriptors import PURE\nassert PURE == 1\n"),
+            ("tests/test_subclass.py", "from subclasses import PURE\nassert PURE == 1\n"),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        assert!(inputs(&all, cone(&cones, "tests.test_descriptor")).contains(&"data/descriptor.txt"));
+        assert!(inputs(&all, cone(&cones, "tests.test_subclass")).contains(&"data/subclass.txt"));
+    }
+
+    #[test]
+    fn tooth_shadowed_and_rebound_decorators_are_eager() {
+        let tree = [
+            ("builtin.py", "property = lambda f: f()\n@property\ndef eager():\n    open('builtin.txt').read()\nPURE = 1\n"),
+            ("imported.py", "import functools\nfunctools.cache = lambda f: f()\n@functools.cache\ndef eager():\n    open('imported.txt').read()\nPURE = 1\n"),
+            ("builtin.txt", "a"),
+            ("imported.txt", "b"),
+            ("tests/test_builtin.py", "from builtin import PURE\n"),
+            ("tests/test_imported.py", "from imported import PURE\n"),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        assert!(inputs(&all, cone(&cones, "tests.test_builtin")).contains(&"builtin.txt"));
+        assert!(inputs(&all, cone(&cones, "tests.test_imported")).contains(&"imported.txt"));
+    }
+
+    #[test]
+    fn tooth_stdlib_imports_do_not_false_match_unrelated_subdirectories_but_match_siblings() {
+        let tree = [
+            ("land/checks/select.py", "import subprocess\ndef run():\n    subprocess.run(['git', 'status'])\nrun()\n"),
+            ("land/checks/sibling.py", "import select\n"),
+            ("fabd/__init__.py", ""),
+            ("fabd/poller.py", "import select\ndef poll():\n    return select\n"),
+            ("tests/test_poller.py", "from fabd.poller import poll\ndef test():\n    poll()\n"),
+            ("tests/test_sibling.py", "import runpy\ndef test():\n    runpy.run_path('land/checks/sibling.py')\n"),
+        ];
+        let (all, cones) = cones_of(&with(&tree, &[]), &config());
+        let poller = cone(&cones, "tests.test_poller");
+        assert!(!poller.widened, "{:?}", causes(&all, poller));
+        assert_eq!(inputs(&all, poller), ["fabd/__init__.py", "fabd/poller.py", "tests/test_poller.py"]);
+
+        let sib = cone(&cones, "tests.test_sibling");
+        assert!(sib.widened);
+        assert_eq!(causes(&all, sib), [("land/checks/select.py".to_owned(), Cause::Process)]);
     }
 }

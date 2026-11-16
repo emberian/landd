@@ -31,11 +31,18 @@ pub fn parse_updates(stdin: &str) -> Result<Vec<RefUpdate>, String> {
         .collect()
 }
 
+/// Most push options inspected by `landd pre-receive`.
+pub const MAX_PUSH_OPTIONS: usize = 64;
+/// Ceiling on `landd pre-receive` stdin bytes (ref update lines).
+pub const MAX_HOOK_STDIN_BYTES: u64 = 1 << 20;
+
 /// The receipts carried as `landd-custody=<hex>` push options.
 pub fn receipts(push_options: &[String]) -> Vec<CustodyEnvelopeV2> {
     let prefix = format!("{}=", custody::PUSH_OPTION);
     push_options
         .iter()
+        .take(MAX_PUSH_OPTIONS)
+        .filter(|option| option.len() <= custody::MAX_PUSH_OPTION_BYTES)
         .filter_map(|option| option.strip_prefix(prefix.as_str()))
         .filter_map(hex_decode)
         .filter_map(|wire| CustodyEnvelopeV2::from_wire(&wire).ok())
@@ -162,5 +169,9 @@ mod tests {
         let mut runner_only = TrustedKeys::new();
         runner_only.insert("seat", key.trusted(), Grant::new(&["seat"], &["runner-attestation"])).unwrap();
         assert!(check(REPO, &[update(1, 2, MAIN)], &[good], &runner_only, &protect, |_, _| true).is_err());
+
+        // Oversized push options are dropped before hex decoding.
+        let giant = format!("{}={}", custody::PUSH_OPTION, "aa".repeat(custody::MAX_PUSH_OPTION_BYTES));
+        assert!(receipts(&[giant]).is_empty());
     }
 }

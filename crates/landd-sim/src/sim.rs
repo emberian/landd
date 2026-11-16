@@ -394,7 +394,7 @@ pub fn simulate(ledger: &Ledger, costs: &ModuleCosts, timings: Option<Timings>, 
     };
     let mut notes = vec![
         "observed figures are read off the ledger; nothing in them is modelled".to_owned(),
-        "lead time is from a lane's first applied attempt to its landing, not the wall time of one run".to_owned(),
+        "lead time groups applied runs by submitted commit tip (`tip`, or the row itself when `tip` is absent), measuring the first recorded attempt of that tip in this ledger slice to its landing (`pushed_ts`, else `ts + wall_s`) — not branch authoring time across new commits, and left-censored if a slice begins mid-retry".to_owned(),
         "`hub_cpu_total_s` is the hub's CPU; it is not test-module CPU and is not compared with anything".to_owned(),
     ];
     if observed.inner_refused_attempts > 0 {

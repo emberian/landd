@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn journal_persists_before_send_and_survives_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let b = binding(2);
         let journal = DeliveryJournal::open(dir.path());
         assert_eq!(journal.load(&b).unwrap(), Stored { delivery: Delivery::fresh(b.clone()), rev: 0 });
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn tooth_journal_declined_then_forge_confirms() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let b = binding(3);
         let journal = DeliveryJournal::open(dir.path());
         journal.transition(&b, |d| d.declined(conflict())).unwrap();
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn tooth_mismatched_binding_under_same_key_errors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let journal = DeliveryJournal::open(dir.path());
         let (a, b) = (binding(2), binding(3));
         let key = a.key();
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn journal_finds_latest_revision_across_many_refusals() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let b = binding(4);
         let journal = DeliveryJournal::open(dir.path());
         for round in 0..37u64 {
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn tooth_concurrent_starts_send_exactly_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let b = binding(5);
         let journal = DeliveryJournal::open(dir.path());
         let wins: usize = std::thread::scope(|scope| {
@@ -649,7 +649,7 @@ mod tests {
     /// from the lane tip alone, after the base (and so the key) has changed.
     #[test]
     fn tooth_tip_pointer_finds_an_outstanding_send_across_rebinding() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let journal = DeliveryJournal::open(dir.path());
         let first = binding(2);
         assert_eq!(journal.latest_for_tip(&first.repo, &first.target_ref, &first.lane_tip).unwrap(), None);
@@ -692,7 +692,7 @@ mod tests {
         let one_left = Delivery { sends: u32::MAX - 1, ..saturated.clone() };
         assert_eq!(one_left.start(10).unwrap().sends, u32::MAX);
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let journal = DeliveryJournal::open(dir.path());
         journal.transition(&b, |_| Ok(saturated.clone())).unwrap();
         assert!(matches!(journal.transition(&b, |d| d.start(10)), Err(JournalError::Delivery(DeliveryError::SendsExhausted))));

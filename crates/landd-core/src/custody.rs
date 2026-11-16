@@ -777,7 +777,7 @@ mod tests {
         }
         let key = SigningKey::sshsig_from_seed([8; 32]);
         let envelope = seal(&key, json!({"verdict": "green"}));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sig_path = dir.path().join("receipt.sig");
         std::fs::write(&sig_path, envelope.sshsig_armored().unwrap()).unwrap();
         let check = |message: &[u8]| {
@@ -789,8 +789,10 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            child.stdin.take().unwrap().write_all(message).unwrap();
-            child.wait().unwrap().success()
+            let wrote = child.stdin.take().unwrap().write_all(message);
+            let status = child.wait().unwrap();
+            wrote.unwrap();
+            status.success()
         };
         let message = signing_message(&envelope.header, &envelope.claims).unwrap();
         assert!(check(&message));
@@ -860,7 +862,7 @@ mod tests {
         let ungranted = format!(r#"{{"keys":[{{"key_id":"a","alg":"ed25519","key":"{}"}}]}}"#, hex_encode(&[7; 32]));
         assert!(TrustedKeys::from_json(&ungranted).is_err());
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let path = dir.path().join("seat.key.json");
         std::fs::write(&path, format!(r#"{{"key_id":"seat-a","alg":"ed25519","key":"{}"}}"#, hex_encode(&[7; 32]))).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();

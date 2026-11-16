@@ -399,9 +399,26 @@ fn pre_receive(trusted_keys: &Path, repo_id: &str, mut protect: Vec<String>) -> 
     }
     let trusted = TrustedKeys::load(trusted_keys)?;
     let mut stdin = String::new();
-    std::io::stdin().read_to_string(&mut stdin)?;
+    std::io::stdin().take(hook::MAX_HOOK_STDIN_BYTES + 1).read_to_string(&mut stdin)?;
+    if stdin.len() as u64 > hook::MAX_HOOK_STDIN_BYTES {
+        eprintln!("landd pre-receive: ref update input exceeds {} bytes", hook::MAX_HOOK_STDIN_BYTES);
+        return Ok(ExitCode::from(1));
+    }
     let updates = hook::parse_updates(&stdin)?;
-    let count: usize = std::env::var("GIT_PUSH_OPTION_COUNT").ok().and_then(|c| c.parse().ok()).unwrap_or(0);
+    let count: usize = match std::env::var("GIT_PUSH_OPTION_COUNT") {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if n <= hook::MAX_PUSH_OPTIONS => n,
+            Ok(n) => {
+                eprintln!("landd pre-receive: too many push options ({n} > {})", hook::MAX_PUSH_OPTIONS);
+                return Ok(ExitCode::from(1));
+            }
+            Err(_) => {
+                eprintln!("landd pre-receive: malformed GIT_PUSH_OPTION_COUNT {raw:?}");
+                return Ok(ExitCode::from(1));
+            }
+        },
+        Err(_) => 0,
+    };
     let options: Vec<String> = (0..count).filter_map(|i| std::env::var(format!("GIT_PUSH_OPTION_{i}")).ok()).collect();
     // The hook runs inside the receiving repository, with the pushed objects
     // in quarantine; only the variables that say so are kept.

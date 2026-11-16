@@ -107,7 +107,23 @@ pub struct Import {
     pub level: u8,
     /// Names after `import` in a `from` import (`*` for a wildcard).
     pub names: Vec<String>,
+    /// Top-level symbol owning this import (`""` when executed at module import time).
+    pub owner: String,
+    /// `(imported_name, local_name)` bindings (`("", bound)` for `import a.b [as c]`).
+    pub bindings: Vec<(String, String)>,
     pub line: u32,
+}
+
+/// A reference to an imported binding from a specific top-level symbol scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ScopedRef {
+    /// `""` when evaluated at module import time, else the top-level symbol name.
+    pub owner: String,
+    /// Local binding head (`"support"`, `"a"`).
+    pub head: String,
+    /// Outermost dotted chain (`"support.hold_bindings"`, or `"support"` when bare).
+    pub dotted: String,
+    pub call: bool,
 }
 
 /// Where a path expression starts.
@@ -176,9 +192,15 @@ pub enum ReadShape {
 pub struct ReadSite {
     pub line: u32,
     pub func: String,
+    /// Top-level symbol owning this site (`""` when executed at module import time).
+    pub owner: String,
     pub what: String,
     pub shape: ReadShape,
     pub reach: Reach,
+    /// True when `reach.opaque` comes solely from `owner`'s own parameters and
+    /// every intra-module call to `owner` supplies non-opaque arguments.
+    #[serde(default)]
+    pub internal_clean: bool,
 }
 
 /// A module load whose target is not a literal.
@@ -186,6 +208,8 @@ pub struct ReadSite {
 pub struct DynamicLoad {
     pub line: u32,
     pub func: String,
+    /// Top-level symbol owning this load (`""` when executed at module import time).
+    pub owner: String,
     pub what: String,
     /// The literal start of the module name, when the source shows one:
     /// `import_module(f"pkg.plugins.{name}")` has `pkg.plugins.`. A leading
@@ -281,6 +305,17 @@ pub struct FileFacts {
     pub functions: Vec<FunctionFact>,
     /// Sorted by `(name, call)`.
     pub symbols: Vec<SymbolRef>,
+    /// Names statically bound at module top-level.
+    pub defined_symbols: Vec<String>,
+    /// Intra-module `(from_owner, to_symbol_or_star)` dependencies.
+    pub symbol_deps: Vec<(String, String)>,
+    /// Direct intra-module calls `(from_owner, to_top_fn, forwards_own_param)`.
+    #[serde(default)]
+    pub internal_calls: Vec<(String, String, bool)>,
+    /// Scoped references to imported bindings.
+    pub external_refs: Vec<ScopedRef>,
+    /// `(owner, resolved_callee)` for calls, used to scope `whole_tree_calls`.
+    pub scoped_calls: Vec<(String, String)>,
 }
 
 impl FileFacts {

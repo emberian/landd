@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn cold_then_warm_then_incremental() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), FILES);
         let repo = sandbox.repo();
         let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn sweeping_without_a_cache_parses_everything_every_time() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), FILES);
         let repo = sandbox.repo();
         for _ in 0..2 {
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn directory_mode_matches_git_mode_and_shares_the_blob_cache() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), FILES);
         let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
         let (from_git, _) = sweep_git(&sandbox.repo(), "HEAD", Some(&cache)).unwrap();
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn run_sweep_reports_verdicts_and_cones() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), FILES);
         let repo = sandbox.repo();
         let (report, _) = run_sweep(Source::Git { repo: &repo, rev: "HEAD" }, &RulePack::builtin(), None).unwrap();
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn tooth_a_change_in_a_large_directory_invalidates_one_small_pack() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sources: Vec<(String, String)> = (0..400).map(|i| (format!("big/mod_{i:03}.py"), format!("X = {i}\n"))).collect();
         let borrowed: Vec<(&str, &str)> = sources.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
         let sandbox = Sandbox::new(dir.path(), &borrowed);
@@ -683,7 +683,7 @@ mod tests {
     /// a suffix, and a tree listed from a subdirectory.
     #[test]
     fn git_modes_links_and_sniffed_scripts_are_read_as_what_they_are() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox =
             Sandbox::new(dir.path(), &[("lib/impl.py", "I = 1\n"), ("bin/tool", "#!/usr/bin/env python3\nimport lib.impl\n")]);
         std::os::unix::fs::symlink("../lib/impl.py", sandbox.work.join("bin/linked.py")).unwrap();
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn tooth_directory_mode_skips_what_is_not_content() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), "A = 1\n").unwrap();
         let fifo = std::ffi::CString::new(dir.path().join("pipe.py").to_str().unwrap()).unwrap();
         // SAFETY: `mkfifo` is given a valid NUL-terminated path owned by this scope.

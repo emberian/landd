@@ -8,9 +8,10 @@ rust-version.workspace = true
 
 [features]
 # Throwaway-repository helpers for other crates' tests.
-testkit = []
+testkit = ["dep:tempfile"]
 
 [dependencies]
+tempfile = { workspace = true, optional = true }
 base64.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true

@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn tooth_a_conflict_is_dropped_without_delaying_its_peers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
         let one = sandbox.lane("one", "main", &[("a.txt", "one\n")]);
         let clash = sandbox.lane("clash", "main", &[("a.txt", "clash\n")]);
@@ -187,7 +187,7 @@ mod tests {
     /// The identity of a merge does not depend on when it is composed.
     #[test]
     fn tooth_merge_commits_are_a_function_of_their_parents() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "a\n")]);
         let one = sandbox.lane("one", "main", &[("b.txt", "one\n")]);
         let repo = sandbox.repo();
@@ -210,7 +210,7 @@ mod tests {
     /// chain contains it: it lands only if that lane does.
     #[test]
     fn tooth_stacked_and_duplicate_lanes_are_subsumed_not_on_base() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "a\n")]);
         let repo = sandbox.repo();
         let base = repo.rev_parse("main").unwrap();
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn tooth_one_unmergeable_candidate_does_not_fail_the_batch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "a\n")]);
         let good = sandbox.lane("good", "main", &[("b.txt", "good\n")]);
         // A commit with no history in common with main.

@@ -321,6 +321,17 @@ impl GitRepo {
             .process_group(0);
         let mut child = command.spawn()?;
         let (mut out, mut err) = (child.stdout.take().expect("piped stdout"), child.stderr.take().expect("piped stderr"));
+        struct GroupReap(Option<Child>);
+        impl Drop for GroupReap {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    // SAFETY: signals the process group this un-reaped child leads.
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut child = GroupReap(Some(child));
         let deadline = Instant::now() + self.network_timeout;
         let finished = std::thread::scope(|scope| {
             let stdout = scope.spawn(move || {
@@ -335,21 +346,36 @@ impl GitRepo {
                 bytes
             });
             let mut nap = Duration::from_millis(1);
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(nap);
-                        nap = (nap * 2).min(Duration::from_millis(50));
-                    }
-                    _ => break None,
+            let pid = child.0.as_ref().expect("live child").id() as libc::pid_t;
+            let exited = loop {
+                // Observe without reaping: the leader pins the process-group
+                // id until its descendants (including pipe holders) are dead.
+                // SAFETY: this is our own child, and waitid initializes info.
+                let (rc, done) = unsafe {
+                    let mut info: libc::siginfo_t = std::mem::zeroed();
+                    let rc =
+                        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+                    (rc, info.si_pid() != 0)
+                };
+                if rc != 0 {
+                    break false;
                 }
+                if done {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(Duration::from_millis(50));
             };
-            if status.is_none() {
-                // SAFETY: signals the process group this child leads; no memory is touched.
-                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-                let _ = child.wait();
-            }
+            // A normally exited Git can leave a transport child holding its
+            // stderr pipe. Kill the group before joining either pipe reader,
+            // even on success, while the unreaped leader prevents pid reuse.
+            // SAFETY: signals the process group our unreaped child leads.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            let status = child.0.take().expect("live child").wait().ok().filter(|_| exited);
+            drop(child);
             (status, stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default())
         });
         match finished {
@@ -402,6 +428,16 @@ impl GitRepo {
         let mut child = command.spawn()?;
         let mut reader = BufReader::with_capacity(1 << 16, child.stdout.take().expect("piped stdout"));
         let mut pipe = child.stderr.take().expect("piped stderr");
+        struct ChildReap(Option<Child>);
+        impl Drop for ChildReap {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut child = ChildReap(Some(child));
         let (entries, stderr) = std::thread::scope(|scope| {
             // Drained concurrently: a long error message cannot stall the listing.
             let stderr = scope.spawn(move || {
@@ -428,11 +464,14 @@ impl GitRepo {
                 }
             };
             if listed.is_err() {
-                let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                if let Some(live) = child.0.as_mut() {
+                    let _ = live.kill();
+                }
+                drop(reader);
             }
             (listed, stderr.join().unwrap_or_default())
         });
-        let status = child.wait()?;
+        let status = child.0.take().expect("live child").wait()?;
         let entries = entries?;
         if !status.success() {
             return Err(GitError::Failed { args: format!("ls-tree -r -z --full-tree {tree}"), code: status.code(), stderr });
@@ -658,6 +697,48 @@ fn parse_tree_record(record: &[u8]) -> Result<TreeEntry, GitError> {
 /// Helpers for building throwaway repositories in tests (all crates).
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit {
+    /// A trusted fixture root, independent of the invoking shell's umask.
+    /// Default temporary-directory permissions may be group-writable.
+    pub fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir()
+    }
+
+    /// Owns a test child process (`landd daemon`, helper subprocesses) and
+    /// guarantees it is killed and reaped even if an assertion unwinds.
+    pub struct ChildGuard(Option<std::process::Child>);
+
+    impl ChildGuard {
+        pub fn new(child: std::process::Child) -> Self {
+            Self(Some(child))
+        }
+
+        pub fn id(&self) -> u32 {
+            self.0.as_ref().expect("live child").id()
+        }
+
+        pub fn inner_mut(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().expect("live child")
+        }
+
+        pub fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+            self.0.take().expect("live child").wait()
+        }
+
+        pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+            self.0.take().expect("live child").wait_with_output()
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     use super::*;
 
     pub fn who() -> Identity {
@@ -775,7 +856,7 @@ mod tests {
 
     #[test]
     fn ls_tree_and_blob_reader_read_objects_directly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "alpha\n"), ("dir/b with space.txt", "beta\n")]);
         let repo = sandbox.repo();
 
@@ -808,7 +889,7 @@ mod tests {
 
     #[test]
     fn merge_tree_reports_clean_trees_and_conflicting_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n"), ("b.txt", "one\n")]);
         let left = sandbox.lane("left", "main", &[("a.txt", "left\n")]);
         let right = sandbox.lane("right", "main", &[("b.txt", "right\n")]);
@@ -833,7 +914,7 @@ mod tests {
 
     #[test]
     fn tooth_lease_push_is_a_strict_compare_and_swap() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n")]);
         let repo = sandbox.repo();
         let base = repo.rev_parse("main").unwrap();
@@ -856,7 +937,7 @@ mod tests {
     /// The read of the destination follows the push URL, not the fetch URL.
     #[test]
     fn tooth_destination_reads_use_the_push_url() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n")]);
         let mirror = dir.path().join("stale-mirror.git");
         sandbox.git(&["clone", "--quiet", "--bare", sandbox.forge.to_str().unwrap(), mirror.to_str().unwrap()]);
@@ -882,7 +963,7 @@ mod tests {
 
     #[test]
     fn tooth_network_commands_die_at_their_deadline() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n")]);
         let repo = sandbox.repo().with_network_timeout(Duration::from_millis(300));
         // A transport that never answers.
@@ -906,10 +987,32 @@ mod tests {
     }
 
     #[test]
+    fn tooth_exited_network_leaders_do_not_leave_pipe_holders_alive() {
+        let dir = crate::git::testkit::private_tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n")]);
+        let repo = sandbox.repo().with_network_timeout(Duration::from_millis(300));
+        let marker = dir.path().join("pipe-holder-survived");
+        let script = dir.path().join("exit-with-child.sh");
+        // Close the protocol stdout in the descendant, but keep Git's stderr
+        // open. Git exits on the protocol EOF while the pipe reader still waits.
+        std::fs::write(&script, format!("#!/bin/sh\n(sleep 3; touch {}) >/dev/null &\nexit 0\n", marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "ext:file");
+        let started = Instant::now();
+        let result = repo.ls_remote(&format!("ext::{}", script.display()), "refs/heads/main");
+        // Preserve the Git exit failure, rather than turning early EOF into a
+        // timeout or letting the reader wait for the descendant's three seconds.
+        assert!(matches!(result, Err(GitError::Failed { .. })), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(!marker.exists(), "an exited transport left its descendants running");
+    }
+
+    #[test]
     fn tooth_inherited_git_location_variables_are_ignored() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "mine\n")]);
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::git::testkit::private_tempdir().unwrap();
         let elsewhere = Sandbox::new(other.path(), &[("b.txt", "theirs\n")]);
         // What a hook or a wrapper script would leave in the environment.
         let mut command = sandbox.repo().command();
@@ -931,7 +1034,7 @@ mod tests {
     #[test]
     fn tooth_paths_that_are_not_utf8_are_refused() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n")]);
         std::fs::write(sandbox.work.join(std::ffi::OsStr::from_bytes(b"caf\xe9.py")), "x = 1\n").unwrap();
         sandbox.git(&["add", "-A"]);
@@ -941,7 +1044,7 @@ mod tests {
 
     #[test]
     fn ls_tree_lists_from_the_root_whatever_directory_is_opened() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), &[("a.txt", "one\n"), ("sub/b.txt", "two\n")]);
         let inside = GitRepo::open(sandbox.work.join("sub")).unwrap();
         let paths: Vec<String> = inside.ls_tree("HEAD", false).unwrap().into_iter().map(|e| e.path).collect();

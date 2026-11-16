@@ -31,7 +31,7 @@
 use crate::facts::*;
 use landd_core::Digest32;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
 /// Deeper syntax than this is not walked; the file is marked `truncated`.
@@ -110,27 +110,46 @@ fn extract_python(source: &[u8]) -> FileFacts {
         aliases: HashMap::new(),
         symbols: BTreeMap::new(),
         scope: Vec::new(),
+        fn_depth: 0,
+        defined_top: BTreeSet::new(),
+        non_import_top: HashSet::new(),
+        plain_classes: HashSet::new(),
+        rebound_names: HashSet::new(),
+        symbol_deps: BTreeSet::new(),
+        internal_calls: BTreeSet::new(),
+        direct_call_sites: HashMap::new(),
+        external_refs: BTreeSet::new(),
+        scoped_calls: BTreeSet::new(),
         loops: Vec::new(),
         caught: Vec::new(),
         env: HashMap::new(),
         literals: HashMap::new(),
-        params: HashSet::new(),
+        own_params: HashSet::new(),
+        nested_params: HashSet::new(),
+        globals_in_owner: HashSet::new(),
     };
     walker.prepare(root);
     walker.visit(root, 0);
-    let Walker { mut facts, symbols, bad_text, .. } = walker;
+    let Walker { mut facts, symbols, bad_text, defined_top, symbol_deps, internal_calls, external_refs, scoped_calls, .. } =
+        walker;
     facts.parse_error |= bad_text.get();
     facts.symbols = symbols.into_iter().map(|((name, call), (line, count))| SymbolRef { name, call, line, count }).collect();
+    facts.defined_symbols = defined_top.into_iter().collect();
+    facts.symbol_deps = symbol_deps.into_iter().collect();
+    facts.internal_calls = internal_calls.into_iter().collect();
+    facts.external_refs = external_refs.into_iter().collect();
+    facts.scoped_calls = scoped_calls.into_iter().collect();
     facts
 }
 
 /// The evaluator's working form of a [`Reach`], which also remembers that a
-/// path is provably scratch.
+/// path is provably scratch or derived from the enclosing function's parameter.
 #[derive(Clone, Default, PartialEq)]
 struct R {
     places: Vec<Place>,
     unknown: bool,
     opaque: bool,
+    own_param: bool,
     temp: bool,
 }
 
@@ -165,12 +184,12 @@ impl R {
     }
 
     fn is_nothing(&self) -> bool {
-        !self.rooted() && !self.opaque
+        !self.rooted() && !self.opaque && !self.own_param
     }
 
     /// Returns whether anything was added.
     fn merge(&mut self, other: R) -> bool {
-        let before = (self.places.len(), self.unknown, self.opaque, self.temp);
+        let before = (self.places.len(), self.unknown, self.opaque, self.own_param, self.temp);
         for place in other.places {
             if self.places.contains(&place) {
                 continue;
@@ -183,8 +202,9 @@ impl R {
         }
         self.unknown |= other.unknown;
         self.opaque |= other.opaque;
+        self.own_param |= other.own_param;
         self.temp |= other.temp;
-        before != (self.places.len(), self.unknown, self.opaque, self.temp)
+        before != (self.places.len(), self.unknown, self.opaque, self.own_param, self.temp)
     }
 
     fn up(mut self, levels: usize) -> Self {
@@ -255,7 +275,7 @@ impl R {
     }
 
     fn into_reach(self) -> Reach {
-        Reach { places: self.places, unknown: self.unknown, opaque: self.opaque }
+        Reach { places: self.places, unknown: self.unknown, opaque: self.opaque || self.own_param }
     }
 }
 
@@ -273,15 +293,33 @@ struct Walker<'s> {
     aliases: HashMap<&'s str, String>,
     symbols: BTreeMap<(String, bool), (u32, u32)>,
     scope: Vec<&'s str>,
+    /// Nesting inside deferred function/lambda bodies (`0` at module import time).
+    fn_depth: usize,
+    defined_top: BTreeSet<String>,
+    /// Top-level names defined by `def`, `class`, or assignments (not solely imports).
+    non_import_top: HashSet<String>,
+    /// Undecorated top-level classes with no custom `__new__`/metaclass/bases.
+    plain_classes: HashSet<String>,
+    /// Names assigned anywhere, including heads of attribute writes.
+    rebound_names: HashSet<String>,
+    symbol_deps: BTreeSet<(String, String)>,
+    internal_calls: BTreeSet<(String, String, bool)>,
+    direct_call_sites: HashMap<usize, (String, String, bool)>,
+    external_refs: BTreeSet<ScopedRef>,
+    scoped_calls: BTreeSet<(String, String)>,
     loops: Vec<Loop>,
     /// Names bound by the enclosing `except … as name` clauses.
     caught: Vec<&'s str>,
-    /// What each bound name may hold as a path.
-    env: HashMap<&'s str, R>,
-    /// Names bound to literal strings: a constant, or a loop over a literal tuple.
-    literals: HashMap<&'s str, Vec<String>>,
-    /// Every parameter name in the module: a caller may pass anything.
-    params: HashSet<&'s str>,
+    /// What each `(owner, var)` bound name may hold as a path.
+    env: HashMap<(String, &'s str), R>,
+    /// `(owner, var)` bound solely to literal strings.
+    literals: HashMap<(String, &'s str), Vec<String>>,
+    /// Parameters `(fn_name, param)` of top-level functions.
+    own_params: HashSet<(String, &'s str)>,
+    /// Parameters `(owner, param)` of methods, lambdas and nested functions.
+    nested_params: HashSet<(String, &'s str)>,
+    /// `global name` declarations inside `owner`.
+    globals_in_owner: HashSet<(String, &'s str)>,
 }
 
 fn line_of(node: Node) -> u32 {
@@ -380,6 +418,128 @@ impl<'s> Walker<'s> {
         self.scope.join(".")
     }
 
+    /// Top-level symbol owning the current deferred body, or `""` when
+    /// evaluated at module import time.
+    fn owner_for(plain_classes: &HashSet<String>, scope: &[&str], fn_depth: usize) -> String {
+        if fn_depth == 0 {
+            String::new()
+        } else if scope.len() >= 2 && scope[1] == "__init__" && plain_classes.contains(scope[0]) {
+            format!("{}.__init__", scope[0])
+        } else {
+            scope.first().copied().unwrap_or("").to_owned()
+        }
+    }
+
+    fn owner(&self) -> String {
+        Self::owner_for(&self.plain_classes, &self.scope, self.fn_depth)
+    }
+
+    fn collect_binding_targets(&mut self, node: Node) {
+        match node.kind() {
+            "identifier" => {
+                let name = self.text(node);
+                if !name.is_empty() {
+                    self.defined_top.insert(name.to_owned());
+                    self.non_import_top.insert(name.to_owned());
+                }
+            }
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "tuple"
+            | "list"
+            | "parenthesized_expression"
+            | "list_splat_pattern"
+            | "as_pattern" => {
+                for child in named(node) {
+                    self.collect_binding_targets(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_top_bindings(&mut self, node: Node) {
+        match node.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)).filter(|n| !n.is_empty()) {
+                    self.defined_top.insert(name.to_owned());
+                    self.non_import_top.insert(name.to_owned());
+                }
+                return;
+            }
+            "lambda" | "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression" => return,
+            "import_statement" => {
+                for child in named(node) {
+                    match child.kind() {
+                        "dotted_name" => {
+                            let head = self.text(child).split('.').next().unwrap_or("");
+                            if !head.is_empty() {
+                                self.defined_top.insert(head.to_owned());
+                            }
+                        }
+                        "aliased_import" => {
+                            if let Some(alias) =
+                                child.child_by_field_name("alias").map(|a| self.text(a)).filter(|a| !a.is_empty())
+                            {
+                                self.defined_top.insert(alias.to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            "import_from_statement" => {
+                for (orig, local) in self.imported_names(node) {
+                    if orig != "*" && !local.is_empty() {
+                        self.defined_top.insert(local.to_owned());
+                    }
+                }
+                return;
+            }
+            "assignment" | "augmented_assignment" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    self.collect_binding_targets(left);
+                }
+                return;
+            }
+            "named_expression" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    self.collect_binding_targets(name);
+                }
+                return;
+            }
+            "for_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    self.collect_binding_targets(left);
+                }
+            }
+            "with_item" => {
+                if let Some(alias) = node
+                    .child_by_field_name("value")
+                    .filter(|v| v.kind() == "as_pattern")
+                    .and_then(|p| p.child_by_field_name("alias"))
+                {
+                    self.collect_binding_targets(alias);
+                }
+                return;
+            }
+            "except_clause" => {
+                let alias = node.child_by_field_name("alias").or_else(|| {
+                    named(node).into_iter().find(|c| c.kind() == "as_pattern").and_then(|p| p.child_by_field_name("alias"))
+                });
+                if let Some(alias) = alias {
+                    self.collect_binding_targets(alias);
+                }
+            }
+            _ => {}
+        }
+        for child in named(node) {
+            self.collect_top_bindings(child);
+        }
+    }
+
     fn site(&self, node: Node, what: impl Into<String>) -> Site {
         Site { line: line_of(node), func: self.func(), what: what.into() }
     }
@@ -445,7 +605,8 @@ impl<'s> Walker<'s> {
             .collect()
     }
 
-    /// The literal strings a node holds: a string, or a tuple or list of strings.
+    /// The literal strings a node holds: a string, a tuple/list of strings,
+    /// or a conditional whose branches both hold literal strings.
     fn string_values(&self, node: Node) -> Option<Vec<String>> {
         match node.kind() {
             "string" | "concatenated_string" => self.literal(node).map(|s| vec![s]),
@@ -453,42 +614,121 @@ impl<'s> Walker<'s> {
                 let items = named(node);
                 (!items.is_empty()).then(|| items.iter().map(|i| self.literal(*i)).collect::<Option<Vec<_>>>()).flatten()
             }
+            "conditional_expression" => {
+                let parts = named(node);
+                if parts.len() == 3 {
+                    let mut out = self.string_values(parts[0])?;
+                    out.extend(self.string_values(parts[2])?);
+                    Some(out)
+                } else {
+                    None
+                }
+            }
             "parenthesized_expression" => node.named_child(0).and_then(|inner| self.string_values(inner)),
             _ => None,
         }
     }
 
-    fn parameter_names(&self, parameters: Node) -> Vec<&'s str> {
+    fn parameter_specs<'t>(&self, parameters: Node<'t>) -> Vec<(&'s str, Option<Node<'t>>, bool)> {
         named(parameters)
             .into_iter()
             .filter_map(|p| match p.kind() {
-                "identifier" => Some(p),
-                "default_parameter" | "typed_default_parameter" => p.child_by_field_name("name"),
-                "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
-                    named(p).into_iter().find(|c| c.kind() == "identifier")
+                "identifier" => Some((self.text(p), None, false)),
+                "default_parameter" | "typed_default_parameter" => {
+                    let name = p.child_by_field_name("name")?;
+                    Some((self.text(name), p.child_by_field_name("value"), false))
+                }
+                "typed_parameter" => {
+                    let name = named(p).into_iter().find(|c| c.kind() == "identifier")?;
+                    Some((self.text(name), None, false))
+                }
+                "list_splat_pattern" | "dictionary_splat_pattern" => {
+                    let name = named(p).into_iter().find(|c| c.kind() == "identifier")?;
+                    Some((self.text(name), None, true))
                 }
                 _ => None,
             })
-            .map(|n| self.text(n))
             .collect()
+    }
+
+    fn detect_plain_classes(&mut self, root: Node) {
+        for stmt in named(root) {
+            if stmt.kind() == "class_definition" {
+                let Some(cls_name) = stmt.child_by_field_name("name").map(|n| self.text(n)).filter(|n| !n.is_empty()) else {
+                    continue;
+                };
+                if self.rebound_names.contains(cls_name) {
+                    continue;
+                }
+                let ok_bases = match stmt.child_by_field_name("superclasses") {
+                    None => true,
+                    Some(supers) => {
+                        let args = named(supers);
+                        args.is_empty()
+                            || (args.len() == 1
+                                && args[0].kind() == "identifier"
+                                && self.text(args[0]) == "object"
+                                && !self.aliases.contains_key("object")
+                                && !self.non_import_top.contains("object"))
+                    }
+                };
+                if !ok_bases {
+                    continue;
+                }
+                let mut ok_body = true;
+                if let Some(body) = stmt.child_by_field_name("body") {
+                    for member in named(body) {
+                        match member.kind() {
+                            "function_definition" => {
+                                let m = member.child_by_field_name("name").map(|n| self.text(n)).unwrap_or("");
+                                if m.starts_with("__") && m != "__init__" {
+                                    ok_body = false;
+                                    break;
+                                }
+                            }
+                            "decorated_definition" => {
+                                let inner = named(member).into_iter().find(|c| c.kind() != "decorator");
+                                let m = inner.and_then(|d| d.child_by_field_name("name")).map(|n| self.text(n)).unwrap_or("");
+                                if m.starts_with("__") {
+                                    ok_body = false;
+                                    break;
+                                }
+                            }
+                            "pass_statement" | "comment" => {}
+                            "expression_statement" if is_string_statement(member) => {}
+                            // Class attributes may install descriptors or replace special methods.
+                            _ => {
+                                ok_body = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if ok_body {
+                    self.plain_classes.insert(cls_name.to_owned());
+                    self.symbol_deps.insert((cls_name.to_owned(), format!("{cls_name}.__init__")));
+                }
+            }
+        }
     }
 
     /// One pass over the whole module before the facts are read off it:
     /// import aliases, and what every bound name may hold as a path.
     fn prepare(&mut self, root: Node) {
-        let mut bindings: Vec<(&'s str, Node)> = Vec::new();
-        let mut functions: HashMap<&'s str, Vec<&'s str>> = HashMap::new();
-        let mut calls: Vec<Node> = Vec::new();
-        let mut loops_over_names: Vec<(&'s str, Node)> = Vec::new();
-        let mut not_literal: HashSet<&'s str> = HashSet::new();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
+        // First collect import aliases and global declarations across the AST.
+        let mut import_stack = vec![root];
+        while let Some(node) = import_stack.pop() {
             match node.kind() {
+                "assignment" | "augmented_assignment" | "named_expression" => {
+                    let left = node.child_by_field_name("left").or_else(|| node.child_by_field_name("name"));
+                    if let Some(raw) = left.and_then(|n| self.dotted(n)) {
+                        self.rebound_names.insert(raw.split('.').next().unwrap_or("").to_owned());
+                    }
+                }
                 "import_statement" => {
                     for child in named(node) {
                         match child.kind() {
                             "dotted_name" => {
-                                // `import a.b` binds `a`.
                                 let head = self.text(child).split('.').next().unwrap_or("");
                                 self.aliases.entry(head).or_insert_with(|| head.to_owned());
                             }
@@ -513,6 +753,177 @@ impl<'s> Walker<'s> {
                         }
                     }
                 }
+                _ => {}
+            }
+            import_stack.extend(named(node));
+        }
+
+        self.collect_top_bindings(root);
+        self.detect_plain_classes(root);
+
+        type ParameterSpecs<'s, 't> = Vec<(&'s str, Option<Node<'t>>, bool)>;
+        struct Prep<'s, 't> {
+            bindings: Vec<((String, &'s str), String, Node<'t>)>,
+            functions: HashMap<&'s str, ParameterSpecs<'s, 't>>,
+            ambiguous_fns: HashSet<&'s str>,
+            calls: Vec<(String, Node<'t>)>,
+            loops_over_names: Vec<((String, &'s str), String, Node<'t>)>,
+            not_literal: HashSet<(String, &'s str)>,
+        }
+
+        fn walk_globals<'s>(walker: &mut Walker<'s>, node: Node, scope: &mut Vec<&'s str>, fn_depth: usize, depth: usize) {
+            if depth > MAX_DEPTH {
+                return;
+            }
+            match node.kind() {
+                "global_statement" => {
+                    let cur = Walker::owner_for(&walker.plain_classes, scope, fn_depth);
+                    for child in named(node) {
+                        if child.kind() == "identifier" {
+                            let name = walker.text(child);
+                            if !name.is_empty() {
+                                walker.defined_top.insert(name.to_owned());
+                                walker.non_import_top.insert(name.to_owned());
+                                if !cur.is_empty() {
+                                    walker.globals_in_owner.insert((cur.clone(), name));
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                "function_definition" => {
+                    let fn_name = node.child_by_field_name("name").map(|n| walker.text(n)).unwrap_or("");
+                    scope.push(fn_name);
+                    if let Some(body) = node.child_by_field_name("body") {
+                        walk_globals(walker, body, scope, fn_depth + 1, depth + 1);
+                    }
+                    scope.pop();
+                    return;
+                }
+                "class_definition" => {
+                    let cls_name = node.child_by_field_name("name").map(|n| walker.text(n)).unwrap_or("");
+                    scope.push(cls_name);
+                    if let Some(body) = node.child_by_field_name("body") {
+                        walk_globals(walker, body, scope, fn_depth, depth + 1);
+                    }
+                    scope.pop();
+                    return;
+                }
+                _ => {}
+            }
+            for child in named(node) {
+                walk_globals(walker, child, scope, fn_depth, depth + 1);
+            }
+        }
+
+        fn walk_prep<'s, 't>(
+            walker: &mut Walker<'s>,
+            node: Node<'t>,
+            prep: &mut Prep<'s, 't>,
+            scope: &mut Vec<&'s str>,
+            fn_depth: usize,
+            depth: usize,
+        ) {
+            if depth > MAX_DEPTH {
+                return;
+            }
+            let cur = Walker::owner_for(&walker.plain_classes, scope, fn_depth);
+            let var_key = |w: &Walker<'s>, cur: &str, name: &'s str| -> (String, &'s str) {
+                if cur.is_empty() || w.globals_in_owner.contains(&(cur.to_owned(), name)) {
+                    (String::new(), name)
+                } else {
+                    (cur.to_owned(), name)
+                }
+            };
+
+            match node.kind() {
+                "function_definition" => {
+                    let fn_name = node.child_by_field_name("name").map(|n| walker.text(n)).unwrap_or("");
+                    let specs = node.child_by_field_name("parameters").map(|p| walker.parameter_specs(p)).unwrap_or_default();
+                    for (_, def_val, _) in &specs {
+                        if let Some(val) = def_val {
+                            walk_prep(walker, *val, prep, scope, fn_depth, depth + 1);
+                        }
+                    }
+                    if let Some(ret) = node.child_by_field_name("return_type") {
+                        walk_prep(walker, ret, prep, scope, fn_depth, depth + 1);
+                    }
+                    let top = fn_depth == 0
+                        && scope.is_empty()
+                        && node.parent().is_some_and(|p| {
+                            p.kind() == "module"
+                                || (p.kind() == "decorated_definition" && p.parent().is_some_and(|g| g.kind() == "module"))
+                        });
+                    scope.push(fn_name);
+                    let body_owner = Walker::owner_for(&walker.plain_classes, scope, fn_depth + 1);
+                    if top && !fn_name.is_empty() {
+                        if prep.functions.contains_key(fn_name) {
+                            prep.ambiguous_fns.insert(fn_name);
+                            for (pname, _, _) in &specs {
+                                walker.nested_params.insert((body_owner.clone(), *pname));
+                            }
+                        } else {
+                            for (pname, def_val, _) in &specs {
+                                walker.own_params.insert((body_owner.clone(), *pname));
+                                if let Some(val) = def_val {
+                                    prep.bindings.push(((body_owner.clone(), *pname), cur.clone(), *val));
+                                }
+                            }
+                            prep.functions.insert(fn_name, specs);
+                        }
+                    } else {
+                        for (pname, def_val, _) in specs.into_iter().filter(|(n, _, _)| !matches!(*n, "self" | "cls")) {
+                            walker.nested_params.insert((body_owner.clone(), pname));
+                            if let Some(val) = def_val {
+                                prep.bindings.push(((body_owner.clone(), pname), cur.clone(), val));
+                            }
+                        }
+                    }
+                    if let Some(body) = node.child_by_field_name("body") {
+                        walk_prep(walker, body, prep, scope, fn_depth + 1, depth + 1);
+                    }
+                    scope.pop();
+                    return;
+                }
+                "lambda" => {
+                    let specs = node.child_by_field_name("parameters").map(|p| walker.parameter_specs(p)).unwrap_or_default();
+                    let mut pushed_target = false;
+                    if fn_depth == 0 && scope.is_empty() {
+                        if let Some(assign) = node.parent().filter(|p| p.kind() == "assignment") {
+                            if let Some(left) = assign.child_by_field_name("left").filter(|l| l.kind() == "identifier") {
+                                scope.push(walker.text(left));
+                                pushed_target = true;
+                            }
+                        }
+                    }
+                    let body_owner = Walker::owner_for(&walker.plain_classes, scope, fn_depth + 1);
+                    for (pname, def_val, _) in specs {
+                        walker.nested_params.insert((body_owner.clone(), pname));
+                        if let Some(val) = def_val {
+                            prep.bindings.push(((body_owner.clone(), pname), cur.clone(), val));
+                        }
+                    }
+                    if let Some(body) = node.child_by_field_name("body") {
+                        walk_prep(walker, body, prep, scope, fn_depth + 1, depth + 1);
+                    }
+                    if pushed_target {
+                        scope.pop();
+                    }
+                    return;
+                }
+                "class_definition" => {
+                    let cls_name = node.child_by_field_name("name").map(|n| walker.text(n)).unwrap_or("");
+                    if let Some(supers) = node.child_by_field_name("superclasses") {
+                        walk_prep(walker, supers, prep, scope, fn_depth, depth + 1);
+                    }
+                    scope.push(cls_name);
+                    if let Some(body) = node.child_by_field_name("body") {
+                        walk_prep(walker, body, prep, scope, fn_depth, depth + 1);
+                    }
+                    scope.pop();
+                    return;
+                }
                 "assignment" | "named_expression" => {
                     let (target, value) = if node.kind() == "assignment" {
                         (node.child_by_field_name("left"), node.child_by_field_name("right"))
@@ -520,12 +931,12 @@ impl<'s> Walker<'s> {
                         (node.child_by_field_name("name"), node.child_by_field_name("value"))
                     };
                     if let (Some(target), Some(value)) = (target.filter(|t| t.kind() == "identifier"), value) {
-                        let name = self.text(target);
-                        bindings.push((name, value));
-                        match self.string_values(value) {
-                            Some(values) => self.literals.entry(name).or_default().extend(values),
+                        let key = var_key(walker, &cur, walker.text(target));
+                        prep.bindings.push((key.clone(), cur.clone(), value));
+                        match walker.string_values(value) {
+                            Some(values) => walker.literals.entry(key).or_default().extend(values),
                             None => {
-                                not_literal.insert(name);
+                                prep.not_literal.insert(key);
                             }
                         }
                     }
@@ -535,102 +946,197 @@ impl<'s> Walker<'s> {
                     let alias = pattern.and_then(|p| p.child_by_field_name("alias"));
                     if let (Some(pattern), Some(alias)) = (pattern, alias) {
                         if let Some(value) = pattern.named_child(0) {
-                            let name = self.text(alias);
-                            bindings.push((name, value));
-                            not_literal.insert(name);
+                            let key = var_key(walker, &cur, walker.text(alias));
+                            prep.bindings.push((key.clone(), cur.clone(), value));
+                            prep.not_literal.insert(key);
                         }
                     }
                 }
                 "for_statement" | "for_in_clause" => {
                     if let (Some(left), Some(right)) = (node.child_by_field_name("left"), node.child_by_field_name("right")) {
                         if left.kind() == "identifier" {
-                            let name = self.text(left);
-                            match (self.string_values(right), right.kind()) {
-                                (Some(values), _) => self.literals.entry(name).or_default().extend(values),
+                            let key = var_key(walker, &cur, walker.text(left));
+                            match (walker.string_values(right), right.kind()) {
+                                (Some(values), _) => walker.literals.entry(key).or_default().extend(values),
                                 (None, "tuple" | "list") => {
-                                    // `for p in (REPO / "a", REPO / "b")`: each element in turn.
-                                    bindings.extend(named(right).into_iter().map(|element| (name, element)));
-                                    not_literal.insert(name);
+                                    prep.bindings
+                                        .extend(named(right).into_iter().map(|element| (key.clone(), cur.clone(), element)));
+                                    prep.not_literal.insert(key);
                                 }
-                                (None, "identifier") => loops_over_names.push((name, right)),
+                                (None, "identifier") => prep.loops_over_names.push((key, cur.clone(), right)),
                                 (None, _) => {
-                                    bindings.push((name, right));
-                                    not_literal.insert(name);
+                                    prep.bindings.push((key.clone(), cur.clone(), right));
+                                    prep.not_literal.insert(key);
                                 }
                             }
                         } else {
-                            // Unpacked loop variables are not followed.
                             let mut inner = vec![left];
                             while let Some(part) = inner.pop() {
                                 if part.kind() == "identifier" {
-                                    not_literal.insert(self.text(part));
+                                    prep.not_literal.insert(var_key(walker, &cur, walker.text(part)));
                                 }
                                 inner.extend(named(part));
                             }
                         }
                     }
                 }
-                "function_definition" | "lambda" => {
-                    let names = node.child_by_field_name("parameters").map(|p| self.parameter_names(p)).unwrap_or_default();
-                    self.params.extend(names.iter().copied().filter(|n| !matches!(*n, "self" | "cls")));
-                    let top = node.parent().is_some_and(|p| {
-                        p.kind() == "module"
-                            || (p.kind() == "decorated_definition" && p.parent().is_some_and(|g| g.kind() == "module"))
-                    });
-                    if let (true, Some(name)) = (top && node.kind() == "function_definition", node.child_by_field_name("name")) {
-                        functions.insert(self.text(name), names);
-                    }
+                "call" if node.child_by_field_name("function").is_some_and(|f| f.kind() == "identifier") => {
+                    prep.calls.push((cur.clone(), node));
                 }
-                "call" if node.child_by_field_name("function").is_some_and(|f| f.kind() == "identifier") => calls.push(node),
                 _ => {}
             }
-            stack.extend(named(node));
+            for child in named(node) {
+                walk_prep(walker, child, prep, &mut *scope, fn_depth, depth + 1);
+            }
         }
 
-        for (name, iterable) in loops_over_names {
-            let source = self.text(iterable);
-            match self.literals.get(source).filter(|_| !not_literal.contains(source)).cloned() {
-                Some(values) => self.literals.entry(name).or_default().extend(values),
-                None => {
-                    bindings.push((name, iterable));
-                    not_literal.insert(name);
+        let mut scope = Vec::new();
+        walk_globals(self, root, &mut scope, 0, 0);
+        let mut prep = Prep {
+            bindings: Vec::new(),
+            functions: HashMap::new(),
+            ambiguous_fns: HashSet::new(),
+            calls: Vec::new(),
+            loops_over_names: Vec::new(),
+            not_literal: HashSet::new(),
+        };
+        scope.clear();
+        walk_prep(self, root, &mut prep, &mut scope, 0, 0);
+        for amb in &prep.ambiguous_fns {
+            if let Some(specs) = prep.functions.remove(amb) {
+                for (pname, _, _) in specs {
+                    self.own_params.remove(&(amb.to_string(), pname));
+                    self.nested_params.insert((amb.to_string(), pname));
                 }
             }
         }
-        // A name is a literal only if literals are all it is ever bound to.
-        let params = &self.params;
-        self.literals.retain(|name, _| !not_literal.contains(name) && !params.contains(name));
 
-        // A module-level function's parameters hold what the module's own
-        // calls pass (and, being parameters, whatever any other caller passes).
-        for call in calls {
-            let Some(parameters) = call.child_by_field_name("function").and_then(|f| functions.get(self.text(f))) else {
+        let own_params = &self.own_params;
+        let nested_params = &self.nested_params;
+        for (key, iter_owner, iterable) in prep.loops_over_names {
+            let source = self.text(iterable);
+            let local_key = (iter_owner, source);
+            let top_key = (String::new(), source);
+            let found = if !local_key.0.is_empty()
+                && (self.literals.contains_key(&local_key)
+                    || prep.not_literal.contains(&local_key)
+                    || own_params.contains(&local_key)
+                    || nested_params.contains(&local_key))
+            {
+                self.literals
+                    .get(&local_key)
+                    .filter(|_| {
+                        !prep.not_literal.contains(&local_key)
+                            && !own_params.contains(&local_key)
+                            && !nested_params.contains(&local_key)
+                    })
+                    .cloned()
+            } else {
+                self.literals.get(&top_key).filter(|_| !prep.not_literal.contains(&top_key)).cloned()
+            };
+            match found {
+                Some(values) => self.literals.entry(key).or_default().extend(values),
+                None => {
+                    prep.bindings.push((key.clone(), local_key.0, iterable));
+                    prep.not_literal.insert(key);
+                }
+            }
+        }
+        let not_literal = &prep.not_literal;
+        let own_params = &self.own_params;
+        let nested_params = &self.nested_params;
+        self.literals.retain(|k, _| !not_literal.contains(k) && !own_params.contains(k) && !nested_params.contains(k));
+
+        // Intra-module call bindings to top-level functions.
+        let mut call_arg_bindings: Vec<((String, &'s str), String, Node)> = Vec::new();
+        let mut splat_called: HashSet<&'s str> = HashSet::new();
+        let mut candidate_direct_calls: Vec<(usize, &'s str, String, Vec<Node>)> = Vec::new();
+
+        for (caller_owner, call) in prep.calls {
+            let Some(callee_name) = call.child_by_field_name("function").map(|f| self.text(f)) else {
                 continue;
             };
-            bindings.extend(parameters.iter().copied().zip(positional(call)));
-            if let Some(arguments) = call.child_by_field_name("arguments") {
+            let Some(specs) = prep.functions.get(callee_name) else {
+                continue;
+            };
+            let args_node = call.child_by_field_name("arguments");
+            let has_splat = args_node.into_iter().flat_map(named).any(|a| matches!(a.kind(), "list_splat" | "dictionary_splat"));
+            if has_splat {
+                splat_called.insert(callee_name);
+                for (pname, _, _) in specs {
+                    self.env.entry((callee_name.to_owned(), *pname)).or_default().opaque = true;
+                }
+                continue;
+            }
+            let non_var: Vec<(&'s str, bool)> =
+                specs.iter().filter(|(_, _, var)| !*var).map(|(n, d, _)| (*n, d.is_some())).collect();
+            let pos_args = positional(call);
+            let mut supplied: HashSet<&'s str> = HashSet::new();
+            let mut all_arg_nodes: Vec<Node> = Vec::new();
+            for ((pname, _), val_node) in non_var.iter().zip(pos_args.iter()) {
+                supplied.insert(*pname);
+                all_arg_nodes.push(*val_node);
+                call_arg_bindings.push(((callee_name.to_owned(), *pname), caller_owner.clone(), *val_node));
+            }
+            for extra in pos_args.iter().skip(non_var.len()) {
+                all_arg_nodes.push(*extra);
+            }
+            if let Some(arguments) = args_node {
                 for keyword in named(arguments).into_iter().filter(|a| a.kind() == "keyword_argument") {
-                    let name = keyword.child_by_field_name("name").map(|n| self.text(n)).unwrap_or("");
-                    if let (true, Some(value)) = (parameters.contains(&name), keyword.child_by_field_name("value")) {
-                        bindings.push((name, value));
+                    let kname = keyword.child_by_field_name("name").map(|n| self.text(n)).unwrap_or("");
+                    if let Some(value) = keyword.child_by_field_name("value") {
+                        all_arg_nodes.push(value);
+                        if let Some((pname, _, _)) = specs.iter().find(|(n, _, var)| !*var && *n == kname) {
+                            supplied.insert(*pname);
+                            call_arg_bindings.push(((callee_name.to_owned(), *pname), caller_owner.clone(), value));
+                        }
                     }
                 }
             }
+            for (pname, has_default) in &non_var {
+                if !supplied.contains(pname) && !*has_default {
+                    self.env.entry((callee_name.to_owned(), *pname)).or_default().opaque = true;
+                }
+            }
+            candidate_direct_calls.push((call.start_byte(), callee_name, caller_owner, all_arg_nodes));
+        }
+        for s in &splat_called {
+            for (pname, _, _) in prep.functions.get(s).into_iter().flatten() {
+                self.env.entry(((*s).to_owned(), *pname)).or_default().opaque = true;
+            }
         }
 
-        // Until a bound name has been evaluated it holds nothing (rather
-        // than "anything"), so the order of the bindings does not matter.
-        for (name, _) in &bindings {
-            self.env.entry(name).or_default();
+        // Seed every bound variable and own parameter before the fixpoint.
+        for (key, _, _) in &prep.bindings {
+            self.env.entry(key.clone()).or_default();
+        }
+        for (key, _, _) in &call_arg_bindings {
+            self.env.entry(key.clone()).or_default();
+        }
+        for key in &self.own_params {
+            self.env.entry(key.clone()).or_default().own_param = true;
         }
         for _ in 0..PASSES {
             let mut grew = false;
-            for (name, value) in &bindings {
-                let reach = self.reach(*value, 0);
-                grew |= self.env.entry(name).or_default().merge(reach);
+            for (key, expr_owner, value) in &prep.bindings {
+                let reach = self.reach_in(expr_owner, *value, 0);
+                grew |= self.env.entry(key.clone()).or_default().merge(reach);
+            }
+            for (key, caller_owner, value) in &call_arg_bindings {
+                let mut reach = self.reach_in(caller_owner, *value, 0);
+                // Forwarding `caller_owner`'s own parameter wires `caller_ext -> callee_ext`;
+                // `callee_int` receives the concrete places passed along internal edges.
+                reach.own_param = false;
+                grew |= self.env.entry(key.clone()).or_default().merge(reach);
             }
             if !grew {
                 break;
+            }
+        }
+        for (call_byte, callee_name, caller_owner, arg_nodes) in candidate_direct_calls {
+            if !splat_called.contains(callee_name) && caller_owner != callee_name {
+                let forwards = arg_nodes.iter().any(|a| self.reach_in(&caller_owner, *a, 0).own_param);
+                self.direct_call_sites.insert(call_byte, (caller_owner, callee_name.to_owned(), forwards));
             }
         }
 
@@ -645,7 +1151,7 @@ impl<'s> Walker<'s> {
             if let Some(target) = target {
                 let name = self.text(target);
                 if exports.iter().all(|(seen, _): &(String, Reach)| seen != name) {
-                    exports.push((name.to_owned(), self.reach_name(name).into_reach()));
+                    exports.push((name.to_owned(), self.reach_name_in("", name).into_reach()));
                 }
             }
         }
@@ -663,13 +1169,50 @@ impl<'s> Walker<'s> {
         self.facts.exports = exports;
     }
 
-    fn reach_name(&self, name: &str) -> R {
+    fn lookup_literals(&self, owner: &str, name: &'s str) -> Option<Vec<String>> {
+        if !owner.is_empty() && !self.globals_in_owner.contains(&(owner.to_owned(), name)) {
+            let local_key = (owner.to_owned(), name);
+            if self.env.contains_key(&local_key)
+                || self.literals.contains_key(&local_key)
+                || self.own_params.contains(&local_key)
+                || self.nested_params.contains(&local_key)
+            {
+                return self.literals.get(&local_key).cloned();
+            }
+        }
+        self.literals.get(&(String::new(), name)).cloned()
+    }
+
+    fn reach_name_in(&self, owner: &str, name: &'s str) -> R {
         if name == "__file__" {
             return R::place(Anchor::File);
         }
-        let mut reach = self.env.get(name).cloned().unwrap_or_default();
-        let mut known = self.env.contains_key(name);
-        if let Some(values) = self.literals.get(name) {
+        if !owner.is_empty() && !self.globals_in_owner.contains(&(owner.to_owned(), name)) {
+            let local_key = (owner.to_owned(), name);
+            let is_local = self.env.contains_key(&local_key)
+                || self.literals.contains_key(&local_key)
+                || self.own_params.contains(&local_key)
+                || self.nested_params.contains(&local_key);
+            if is_local {
+                let mut reach = self.env.get(&local_key).cloned().unwrap_or_default();
+                if let Some(values) = self.literals.get(&local_key) {
+                    for value in values {
+                        reach.merge(R::literal(value));
+                    }
+                }
+                if self.own_params.contains(&local_key) {
+                    reach.own_param = true;
+                }
+                if self.nested_params.contains(&local_key) {
+                    reach.opaque = true;
+                }
+                return reach;
+            }
+        }
+        let top_key = (String::new(), name);
+        let mut reach = self.env.get(&top_key).cloned().unwrap_or_default();
+        let mut known = self.env.contains_key(&top_key);
+        if let Some(values) = self.literals.get(&top_key) {
             for value in values {
                 reach.merge(R::literal(value));
             }
@@ -679,23 +1222,24 @@ impl<'s> Walker<'s> {
             reach.merge(R::place(Anchor::Name(target.clone())));
             known = true;
         }
-        if self.params.contains(name) || !known {
+        if !known {
             reach.opaque = true;
         }
         reach
     }
 
     /// `base` followed by one more path segment.
-    fn extend(&self, base: R, segment: Node, depth: usize) -> R {
+    fn extend_in(&self, owner: &str, base: R, segment: Node, depth: usize) -> R {
         let values = match segment.kind() {
-            "identifier" => self.literals.get(self.text(segment)).cloned(),
+            "identifier" => self.lookup_literals(owner, self.text(segment)),
+            "conditional_expression" => self.string_values(segment),
             _ => self.string_values(segment).filter(|v| v.len() == 1),
         };
         match values {
             Some(values) => {
                 let mut out = R { places: Vec::new(), ..base.clone() };
                 for value in values {
-                    out.merge(R { unknown: false, opaque: false, temp: false, ..base.clone() }.join(&value));
+                    out.merge(R { unknown: false, opaque: false, own_param: false, temp: false, ..base.clone() }.join(&value));
                 }
                 out
             }
@@ -709,31 +1253,35 @@ impl<'s> Walker<'s> {
         }
     }
 
-    /// What a path expression may name.
     fn reach(&self, node: Node, depth: usize) -> R {
+        self.reach_in(&self.owner(), node, depth)
+    }
+
+    /// What a path expression may name inside `owner`.
+    fn reach_in(&self, owner: &str, node: Node, depth: usize) -> R {
         if depth > MAX_PATH_DEPTH {
             return R::opaque();
         }
         match node.kind() {
-            "identifier" => self.reach_name(self.text(node)),
+            "identifier" => self.reach_name_in(owner, self.text(node)),
             "string" | "concatenated_string" => match self.literal(node) {
                 Some(text) => R::literal(&text),
-                None => self.reach_fstring(node, depth),
+                None => self.reach_fstring_in(owner, node, depth),
             },
             "parenthesized_expression" | "await" => match node.named_child(0) {
-                Some(inner) => self.reach(inner, depth + 1),
+                Some(inner) => self.reach_in(owner, inner, depth + 1),
                 None => R::opaque(),
             },
             "binary_operator" => {
                 let (Some(left), Some(right)) = (node.child_by_field_name("left"), node.child_by_field_name("right")) else {
                     return R::opaque();
                 };
-                let base = self.reach(left, depth + 1);
+                let base = self.reach_in(owner, left, depth + 1);
                 match node.child_by_field_name("operator").map(|o| self.text(o)) {
-                    Some("/") => self.extend(base, right, depth + 1),
+                    Some("/") => self.extend_in(owner, base, right, depth + 1),
                     // String concatenation: whatever follows is not known.
                     Some("+") => base.opened(),
-                    _ if base.rooted() || self.reach(right, depth + 1).rooted() => R::unknown(),
+                    _ if base.rooted() || self.reach_in(owner, right, depth + 1).rooted() => R::unknown(),
                     _ => R::opaque(),
                 }
             }
@@ -745,7 +1293,7 @@ impl<'s> Walker<'s> {
                     if node.kind() == "conditional_expression" && index == 1 {
                         continue;
                     }
-                    out.merge(self.reach(*part, depth + 1));
+                    out.merge(self.reach_in(owner, *part, depth + 1));
                 }
                 out
             }
@@ -755,15 +1303,19 @@ impl<'s> Walker<'s> {
                     return R::opaque();
                 };
                 if self.text(attribute) == "parent" {
-                    return self.reach(object, depth + 1).up(1);
+                    return self.reach_in(owner, object, depth + 1).up(1);
                 }
                 if let Some(dotted) = self.dotted(node) {
                     let head = dotted.split('.').next().unwrap_or("");
                     if self.aliases.contains_key(head) {
-                        return R::place(Anchor::Name(self.resolve(dotted)));
+                        let resolved = self.resolve(dotted);
+                        if resolved == "os.devnull" {
+                            return R::default();
+                        }
+                        return R::place(Anchor::Name(resolved));
                     }
                 }
-                let inner = self.reach(object, depth + 1);
+                let inner = self.reach_in(owner, object, depth + 1);
                 match (inner.rooted(), inner.temp) {
                     (true, _) => R::unknown(),
                     (false, true) => R::temp(),
@@ -775,7 +1327,7 @@ impl<'s> Walker<'s> {
                 let parents = value.kind() == "attribute"
                     && value.child_by_field_name("attribute").is_some_and(|a| self.text(a) == "parents");
                 if let (true, Some(object)) = (parents, value.child_by_field_name("object")) {
-                    let inner = self.reach(object, depth + 1);
+                    let inner = self.reach_in(owner, object, depth + 1);
                     let index = node.child_by_field_name("subscript").filter(|s| s.kind() == "integer");
                     return match index.and_then(|i| self.text(i).parse::<usize>().ok()) {
                         Some(levels) => inner.up(levels + 1),
@@ -783,20 +1335,20 @@ impl<'s> Walker<'s> {
                         None => inner,
                     };
                 }
-                let inner = self.reach(value, depth + 1);
+                let inner = self.reach_in(owner, value, depth + 1);
                 match (inner.rooted(), inner.temp) {
                     (true, _) => R::unknown(),
                     (false, true) => R::temp(),
                     _ => R::opaque(),
                 }
             }
-            "call" => self.reach_call(node, depth),
+            "call" => self.reach_call_in(owner, node, depth),
             _ => R::opaque(),
         }
     }
 
     /// An f-string: its literal start, then something unknown.
-    fn reach_fstring(&self, node: Node, depth: usize) -> R {
+    fn reach_fstring_in(&self, owner: &str, node: Node, depth: usize) -> R {
         let mut cursor = node.walk();
         for part in node.children(&mut cursor) {
             match part.kind() {
@@ -807,7 +1359,7 @@ impl<'s> Walker<'s> {
                 }
                 "interpolation" => {
                     return match part.child_by_field_name("expression").or_else(|| part.named_child(0)) {
-                        Some(expression) => self.reach(expression, depth + 1).opened(),
+                        Some(expression) => self.reach_in(owner, expression, depth + 1).opened(),
                         None => R::opaque(),
                     };
                 }
@@ -817,7 +1369,7 @@ impl<'s> Walker<'s> {
         R::opaque()
     }
 
-    fn reach_call(&self, node: Node, depth: usize) -> R {
+    fn reach_call_in(&self, owner: &str, node: Node, depth: usize) -> R {
         let Some(function) = node.child_by_field_name("function") else { return R::opaque() };
         let arguments = positional(node);
         let receiver = (function.kind() == "attribute").then(|| function.child_by_field_name("object")).flatten();
@@ -826,9 +1378,10 @@ impl<'s> Walker<'s> {
             "attribute" => function.child_by_field_name("attribute").map(|a| self.text(a)).unwrap_or(""),
             _ => full.as_deref().and_then(|n| n.rsplit('.').next()).unwrap_or(""),
         };
-        let first = |this: &Self| arguments.first().map(|a| this.reach(*a, depth + 1)).unwrap_or_else(R::opaque);
+        let first = |this: &Self| arguments.first().map(|a| this.reach_in(owner, *a, depth + 1)).unwrap_or_else(R::opaque);
         // A path made of each argument in turn: `join(a, b, c)`, `Path(a, b)`.
-        let joined = |this: &Self, base: R, rest: &[Node]| rest.iter().fold(base, |acc, seg| this.extend(acc, *seg, depth + 1));
+        let joined =
+            |this: &Self, base: R, rest: &[Node]| rest.iter().fold(base, |acc, seg| this.extend_in(owner, acc, *seg, depth + 1));
 
         if let Some(name) = full.as_deref() {
             if name.starts_with("tempfile.") {
@@ -843,7 +1396,7 @@ impl<'s> Walker<'s> {
                 | "pathlib.PosixPath"
                 | "pathlib.PurePosixPath" => {
                     return match arguments.split_first() {
-                        Some((head, rest)) => joined(self, self.reach(*head, depth + 1), rest),
+                        Some((head, rest)) => joined(self, self.reach_in(owner, *head, depth + 1), rest),
                         // `Path()` is the working directory.
                         None if name.starts_with("pathlib.") => R::place(Anchor::Root),
                         None => R::opaque(),
@@ -861,7 +1414,7 @@ impl<'s> Walker<'s> {
             }
         }
         if let Some(receiver) = receiver {
-            let object = || self.reach(receiver, depth + 1);
+            let object = || self.reach_in(owner, receiver, depth + 1);
             match last {
                 "resolve" | "absolute" | "expanduser" | "as_posix" | "__fspath__" => return object(),
                 "joinpath" => return joined(self, object(), &arguments),
@@ -870,9 +1423,9 @@ impl<'s> Walker<'s> {
                 _ => {}
             }
         }
-        let mut seen = receiver.map(|r| self.reach(r, depth + 1)).unwrap_or_default();
+        let mut seen = receiver.map(|r| self.reach_in(owner, r, depth + 1)).unwrap_or_default();
         for argument in &arguments {
-            seen.merge(self.reach(*argument, depth + 1));
+            seen.merge(self.reach_in(owner, *argument, depth + 1));
         }
         match (seen.rooted(), seen.temp) {
             (true, _) => R::unknown(),
@@ -893,6 +1446,165 @@ impl<'s> Walker<'s> {
         }
     }
 
+    fn is_pure_decorator(&self, expr: Node) -> bool {
+        let callee = match expr.kind() {
+            "call" => expr.child_by_field_name("function"),
+            _ => Some(expr),
+        };
+        let Some(raw) = callee.and_then(|c| self.dotted(c)) else { return false };
+        let head = raw.split('.').next().unwrap_or("");
+        if self.non_import_top.contains(head) || self.rebound_names.contains(head) {
+            return false;
+        }
+        if !self.aliases.contains_key(head) {
+            return matches!(raw.as_str(), "staticmethod" | "classmethod" | "property");
+        }
+        let resolved = self.resolve(raw);
+        matches!(
+            resolved.as_str(),
+            "dataclasses.dataclass"
+                | "functools.lru_cache"
+                | "functools.cache"
+                | "functools.cached_property"
+                | "functools.wraps"
+                | "contextlib.contextmanager"
+                | "contextlib.asynccontextmanager"
+                | "abc.abstractmethod"
+                | "typing.overload"
+                | "typing.final"
+                | "unittest.skip"
+                | "unittest.skipIf"
+                | "unittest.skipUnless"
+                | "unittest.expectedFailure"
+        )
+    }
+
+    fn record_use(&mut self, raw: &str, call: bool, no_arg_call: bool, passive_owner: Option<&str>) {
+        let cur = self.owner();
+        let eff = if call { cur.as_str() } else { passive_owner.unwrap_or(cur.as_str()) };
+        let head = raw.split('.').next().unwrap_or("");
+        let resolved = self.resolve(raw.to_owned());
+        if call {
+            self.scoped_calls.insert((cur.clone(), resolved.clone()));
+            let dynamic_scope = matches!(
+                resolved.as_str(),
+                "globals" | "builtins.globals" | "eval" | "builtins.eval" | "exec" | "builtins.exec" | "execfile"
+            ) || (matches!(resolved.as_str(), "vars" | "builtins.vars") && no_arg_call)
+                || (matches!(resolved.as_str(), "locals" | "builtins.locals") && cur.is_empty());
+            if dynamic_scope {
+                self.symbol_deps.insert((cur.clone(), "*".to_owned()));
+            }
+            if head == "self" {
+                if let Some(cls) = cur.strip_suffix(".__init__") {
+                    self.symbol_deps.insert((cur.clone(), cls.to_owned()));
+                }
+            }
+        }
+        if !head.is_empty() {
+            if self.non_import_top.contains(head) && eff != head {
+                self.symbol_deps.insert((eff.to_owned(), head.to_owned()));
+            }
+            if self.aliases.contains_key(head) {
+                self.external_refs.insert(ScopedRef {
+                    owner: eff.to_owned(),
+                    head: head.to_owned(),
+                    dotted: raw.to_owned(),
+                    call,
+                });
+            }
+        }
+    }
+
+    fn visit_lhs(&mut self, node: Node, depth: usize) {
+        if depth > MAX_DEPTH {
+            self.facts.truncated = true;
+            return;
+        }
+        match node.kind() {
+            "identifier" => {}
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "tuple"
+            | "list"
+            | "parenthesized_expression"
+            | "list_splat_pattern" => {
+                for child in named(node) {
+                    self.visit_lhs(child, depth + 1);
+                }
+            }
+            _ => self.visit(node, depth),
+        }
+    }
+
+    /// Walk a top-level constant where passive value
+    /// references (`X = fn`, `X = {k: fn}`) attach to
+    /// `target` rather than executing eagerly on module import. Any active
+    /// subexpression (`call`, operator, dict key, comprehension, keyword arg)
+    /// falls back immediately to active `visit`.
+    fn visit_passive(&mut self, target: &str, node: Node, depth: usize) {
+        if depth > MAX_DEPTH {
+            self.facts.truncated = true;
+            return;
+        }
+        match node.kind() {
+            "identifier" => self.reference_under(node, self.text(node).to_owned(), Some(target)),
+            // Attribute lookup can run descriptors or module/object __getattr__.
+            "attribute" => self.visit(node, depth),
+            "tuple" | "list" | "parenthesized_expression" => {
+                for child in named(node) {
+                    self.visit_passive(target, child, depth + 1);
+                }
+            }
+            "dictionary" => {
+                for child in named(node) {
+                    if child.kind() == "pair" {
+                        self.visit_field(child, "key", depth + 1);
+                        if let Some(val) = child.child_by_field_name("value") {
+                            self.visit_passive(target, val, depth + 1);
+                        }
+                    } else {
+                        self.visit(child, depth + 1);
+                    }
+                }
+            }
+            "call"
+                if self.fn_depth == 0
+                    && self.scope.is_empty()
+                    && node
+                        .child_by_field_name("function")
+                        .filter(|f| f.kind() == "identifier")
+                        .is_some_and(|f| self.plain_classes.contains(self.text(f))) =>
+            {
+                let cls = self.text(node.child_by_field_name("function").expect("checked")).to_owned();
+                self.note(cls.clone(), true, line_of(node));
+                self.scoped_calls.insert((String::new(), cls.clone()));
+                self.symbol_deps.insert((String::new(), format!("{cls}.__init__")));
+                if target != cls {
+                    self.symbol_deps.insert((target.to_owned(), cls));
+                }
+                self.visit_field(node, "arguments", depth + 1);
+            }
+            "lambda" if self.fn_depth == 0 && self.scope.is_empty() => {
+                self.visit_field(node, "parameters", depth + 1);
+                // Visit lambda body under `target` by recording through a synthetic scope.
+                // Lookup the target identifier slice in `self.src` via the parent assignment.
+                if let Some(assign) = node.parent().filter(|p| p.kind() == "assignment") {
+                    if let Some(left) = assign.child_by_field_name("left").filter(|l| l.kind() == "identifier") {
+                        self.scope.push(self.text(left));
+                        self.fn_depth += 1;
+                        self.visit_field(node, "body", depth + 1);
+                        self.fn_depth -= 1;
+                        self.scope.pop();
+                        return;
+                    }
+                }
+                self.visit(node, depth);
+            }
+            _ => self.visit(node, depth),
+        }
+    }
+
     fn visit(&mut self, node: Node, depth: usize) {
         if depth > MAX_DEPTH {
             self.facts.truncated = true;
@@ -902,10 +1614,54 @@ impl<'s> Walker<'s> {
             "comment" | "future_import_statement" => {}
             "import_statement" => self.import(node),
             "import_from_statement" => self.import_from(node),
+            "decorated_definition" => {
+                let mut non_pure = false;
+                let mut def_node = None;
+                for child in named(node) {
+                    if child.kind() == "decorator" {
+                        if !child.named_child(0).is_some_and(|expr| self.is_pure_decorator(expr)) {
+                            non_pure = true;
+                        }
+                        self.visit(child, depth + 1);
+                    } else {
+                        def_node = Some(child);
+                    }
+                }
+                if let Some(def_node) = def_node {
+                    if non_pure && self.fn_depth == 0 {
+                        if let Some(target) = def_node.child_by_field_name("name").map(|n| self.text(n)).filter(|n| !n.is_empty())
+                        {
+                            // A custom decorator receives the function/class at definition time
+                            // and may invoke or register it globally.
+                            let target_top = self.scope.first().copied().unwrap_or(target);
+                            self.symbol_deps.insert((self.owner(), target_top.to_owned()));
+                        }
+                    }
+                    self.visit(def_node, depth + 1);
+                }
+            }
             "function_definition" => self.function(node, depth),
             "class_definition" => {
-                self.scope.push(node.child_by_field_name("name").map(|n| self.text(n)).unwrap_or(""));
-                self.visit_field(node, "superclasses", depth);
+                let name = node.child_by_field_name("name").map(|n| self.text(n)).unwrap_or("");
+                self.visit_field(node, "type_parameters", depth);
+                if let Some(supers) = node.child_by_field_name("superclasses") {
+                    if self.fn_depth == 0 && self.scope.is_empty() && !name.is_empty() {
+                        for arg in named(supers) {
+                            if arg.kind() == "keyword_argument" {
+                                self.visit(arg, depth + 1);
+                            } else {
+                                if self.dotted(arg).as_deref() == Some("type") && !self.aliases.contains_key("type") {
+                                    self.symbol_deps.insert((String::new(), name.to_owned()));
+                                }
+                                // Constructing a subclass invokes metaclass / __init_subclass__ hooks.
+                                self.visit(arg, depth + 1);
+                            }
+                        }
+                    } else {
+                        self.visit(supers, depth + 1);
+                    }
+                }
+                self.scope.push(name);
                 self.visit_field(node, "body", depth);
                 self.scope.pop();
             }
@@ -926,6 +1682,30 @@ impl<'s> Walker<'s> {
             }
             "assignment" => {
                 self.assignment(node);
+                let left = node.child_by_field_name("left");
+                let right = node.child_by_field_name("right");
+                if let Some(left) = left {
+                    self.visit_lhs(left, depth + 1);
+                }
+                self.visit_field(node, "type", depth);
+                if let Some(right) = right {
+                    let top_ident = (self.fn_depth == 0 && self.scope.is_empty())
+                        .then(|| left.filter(|l| l.kind() == "identifier").map(|l| self.text(l)).filter(|n| !n.is_empty()))
+                        .flatten();
+                    match top_ident {
+                        Some(target) => self.visit_passive(target, right, depth + 1),
+                        None => self.visit(right, depth + 1),
+                    }
+                }
+            }
+            "subscript" => {
+                if let (Some(val), Some(sub)) = (node.child_by_field_name("value"), node.child_by_field_name("subscript")) {
+                    if self.dotted(val).map(|d| self.resolve(d)).as_deref() == Some("sys.modules")
+                        && self.text(sub).contains("__name__")
+                    {
+                        self.symbol_deps.insert((self.owner(), "*".to_owned()));
+                    }
+                }
                 self.children(node, depth);
             }
             "call" => self.call(node, depth),
@@ -942,8 +1722,23 @@ impl<'s> Walker<'s> {
     }
 
     /// A non-call reference. Only names that lead back to an import are
-    /// facts; locals, parameters and attributes of locals are not.
+    /// recorded in `facts.symbols`; intra-module top-level references are
+    /// recorded in `symbol_deps`.
     fn reference(&mut self, node: Node, name: String) {
+        self.reference_under(node, name, None);
+    }
+
+    fn reference_under(&mut self, node: Node, name: String, passive_owner: Option<&str>) {
+        if name == "self" {
+            let cur = self.owner();
+            if let Some(cls) = cur.strip_suffix(".__init__") {
+                // Escaping `self` may expose every method, even through an apparent
+                // WeakSet: that binding can be replaced or have custom hash behavior.
+                let cls = cls.to_owned();
+                self.symbol_deps.insert((cur, cls));
+            }
+        }
+        self.record_use(&name, false, false, passive_owner);
         if !self.aliases.contains_key(name.split('.').next().unwrap_or("")) {
             return;
         }
@@ -956,40 +1751,81 @@ impl<'s> Walker<'s> {
     }
 
     fn dynamic(&mut self, node: Node, what: impl Into<String>, prefix: Option<String>) {
-        let load = DynamicLoad { line: line_of(node), func: self.func(), what: what.into(), prefix };
+        let load = DynamicLoad { line: line_of(node), func: self.func(), owner: self.owner(), what: what.into(), prefix };
         self.facts.dynamic_loads.push(load);
     }
 
     fn import(&mut self, node: Node) {
+        let owner = self.owner();
         for child in named(node) {
-            let module = match child.kind() {
-                "dotted_name" => self.text(child),
-                "aliased_import" => match child.child_by_field_name("name") {
-                    Some(name) => self.text(name),
-                    None => continue,
+            let (module, bound) = match child.kind() {
+                "dotted_name" => {
+                    let m = self.text(child);
+                    (m, m.split('.').next().unwrap_or(""))
+                }
+                "aliased_import" => match (child.child_by_field_name("name"), child.child_by_field_name("alias")) {
+                    (Some(name), Some(alias)) => (self.text(name), self.text(alias)),
+                    (Some(name), None) => {
+                        let m = self.text(name);
+                        (m, m.split('.').next().unwrap_or(""))
+                    }
+                    _ => continue,
                 },
                 _ => continue,
             };
-            self.facts.imports.push(Import { module: module.to_owned(), level: 0, names: Vec::new(), line: line_of(node) });
+            let bindings = if bound.is_empty() { Vec::new() } else { vec![(String::new(), bound.to_owned())] };
+            self.facts.imports.push(Import {
+                module: module.to_owned(),
+                level: 0,
+                names: Vec::new(),
+                owner: owner.clone(),
+                bindings,
+                line: line_of(node),
+            });
         }
     }
 
     fn import_from(&mut self, node: Node) {
         let (level, module) = self.import_source(node);
-        let mut names: Vec<String> = self.imported_names(node).into_iter().map(|(name, _)| name.to_owned()).collect();
+        let pairs = self.imported_names(node);
+        let mut names: Vec<String> = pairs.iter().map(|(name, _)| (*name).to_owned()).collect();
+        let mut bindings: Vec<(String, String)> =
+            pairs.into_iter().filter(|(n, _)| !n.is_empty()).map(|(n, l)| (n.to_owned(), l.to_owned())).collect();
         if named(node).into_iter().any(|c| c.kind() == "wildcard_import") {
             names.push("*".to_owned());
+            bindings.push(("*".to_owned(), "*".to_owned()));
             if level == 0 && SENSITIVE_WILDCARDS.contains(&module) {
                 // Every name of the module is now callable bare, so a loader
                 // or a scan can no longer be recognised by its name.
                 self.dynamic(node, format!("wildcard import of {module}"), None);
             }
         }
-        self.facts.imports.push(Import { module: module.to_owned(), level, names, line: line_of(node) });
+        self.facts.imports.push(Import {
+            module: module.to_owned(),
+            level,
+            names,
+            owner: self.owner(),
+            bindings,
+            line: line_of(node),
+        });
     }
 
     fn function(&mut self, node: Node, depth: usize) {
-        self.scope.push(node.child_by_field_name("name").map(|n| self.text(n)).unwrap_or(""));
+        let fn_name = node.child_by_field_name("name").map(|n| self.text(n)).unwrap_or("");
+        if self.fn_depth == 0 {
+            if self.scope.is_empty() && matches!(fn_name, "__getattr__" | "__dir__") {
+                self.symbol_deps.insert((String::new(), fn_name.to_owned()));
+            } else if self.scope.len() == 1 && fn_name == "__init_subclass__" {
+                self.symbol_deps.insert((String::new(), self.scope[0].to_owned()));
+            }
+        }
+        // Parameter defaults and annotations run when `def` executes, in the
+        // enclosing scope rather than inside the deferred function body.
+        self.visit_field(node, "type_parameters", depth);
+        self.visit_field(node, "parameters", depth);
+        self.visit_field(node, "return_type", depth);
+
+        self.scope.push(fn_name);
         if let Some(body) = node.child_by_field_name("body") {
             let (body_hash, statements) = hash_body(body, self.src);
             self.facts.functions.push(FunctionFact { name: self.func(), line: line_of(node), body_hash, statements });
@@ -997,9 +1833,9 @@ impl<'s> Walker<'s> {
         // A nested function is not "inside" the loop or handler that defines it.
         let loops = std::mem::take(&mut self.loops);
         let caught = std::mem::take(&mut self.caught);
-        self.visit_field(node, "parameters", depth);
-        self.visit_field(node, "return_type", depth);
+        self.fn_depth += 1;
         self.visit_field(node, "body", depth);
+        self.fn_depth -= 1;
         self.loops = loops;
         self.caught = caught;
         self.scope.pop();
@@ -1164,7 +2000,17 @@ impl<'s> Walker<'s> {
         if target.is_nothing() {
             return;
         }
-        let site = ReadSite { line: line_of(node), func: self.func(), what: what.to_owned(), shape, reach: target.into_reach() };
+        let owner = self.owner();
+        let internal_clean = !owner.is_empty() && !target.opaque && target.own_param;
+        let site = ReadSite {
+            line: line_of(node),
+            func: self.func(),
+            owner,
+            what: what.to_owned(),
+            shape,
+            reach: target.into_reach(),
+            internal_clean,
+        };
         self.facts.reads.push(site);
     }
 
@@ -1186,7 +2032,14 @@ impl<'s> Walker<'s> {
             let flag = argv.get(1).and_then(|a| self.literal(*a));
             match (flag.as_deref(), argv.get(1), argv.get(2).and_then(|a| self.literal(*a))) {
                 (Some("-m"), _, Some(module)) => {
-                    self.facts.imports.push(Import { module, level: 0, names: Vec::new(), line: line_of(node) });
+                    self.facts.imports.push(Import {
+                        module,
+                        level: 0,
+                        names: Vec::new(),
+                        owner: self.owner(),
+                        bindings: Vec::new(),
+                        line: line_of(node),
+                    });
                     return;
                 }
                 (Some(flag), _, _) if flag.starts_with('-') => {}
@@ -1208,7 +2061,8 @@ impl<'s> Walker<'s> {
             return self.children(node, depth);
         };
         let arguments = node.child_by_field_name("arguments");
-        let full = self.dotted(function).map(|name| self.resolve(name));
+        let raw_dotted = self.dotted(function);
+        let full = raw_dotted.clone().map(|name| self.resolve(name));
         let method = function.kind() == "attribute";
         let receiver = method.then(|| function.child_by_field_name("object")).flatten();
         let last: String = match &full {
@@ -1250,6 +2104,8 @@ impl<'s> Walker<'s> {
                             module: target[level..].to_owned(),
                             level: level.min(255) as u8,
                             names,
+                            owner: self.owner(),
+                            bindings: Vec::new(),
                             line: line_of(node),
                         });
                     }
@@ -1260,9 +2116,14 @@ impl<'s> Walker<'s> {
                 }
             }
             "runpy.run_module" => match &first_literal {
-                Some(module) => {
-                    self.facts.imports.push(Import { module: module.clone(), level: 0, names: Vec::new(), line: line_of(node) })
-                }
+                Some(module) => self.facts.imports.push(Import {
+                    module: module.clone(),
+                    level: 0,
+                    names: Vec::new(),
+                    owner: self.owner(),
+                    bindings: Vec::new(),
+                    line: line_of(node),
+                }),
                 None => {
                     let prefix = positional.first().and_then(|a| self.module_prefix(*a));
                     self.dynamic(node, name, prefix);
@@ -1328,7 +2189,7 @@ impl<'s> Walker<'s> {
                     "walk" => self.read(node, &what, ReadShape::Subtree, of_receiver(self)),
                     "glob" | "rglob" => {
                         let patterns = positional.first().and_then(|a| match a.kind() {
-                            "identifier" => self.literals.get(self.text(*a)).cloned(),
+                            "identifier" => self.lookup_literals(&self.owner(), self.text(*a)),
                             _ => self.string_values(*a),
                         });
                         let target = of_receiver(self);
@@ -1369,6 +2230,16 @@ impl<'s> Walker<'s> {
             self.facts.settings_reads.push(SettingsRead { line: line_of(node), reader: last.clone(), key });
         }
 
+        if name == "sys.modules.get" && positional.first().is_some_and(|a| self.text(*a) == "__name__") {
+            self.symbol_deps.insert((self.owner(), "*".to_owned()));
+        }
+        if let Some((caller, callee, forwards)) = self.direct_call_sites.get(&node.start_byte()).cloned() {
+            let resolved = self.resolve(callee.clone());
+            self.scoped_calls.insert((caller.clone(), resolved));
+            self.internal_calls.insert((caller, callee, forwards));
+        } else if let Some(raw) = &raw_dotted {
+            self.record_use(raw, true, positional.is_empty(), None);
+        }
         match full {
             Some(name) => self.note(name, true, line_of(node)),
             None => self.visit(function, depth + 1),

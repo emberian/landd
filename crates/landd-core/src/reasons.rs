@@ -686,7 +686,7 @@ mod tests {
     /// reader consults a clock.
     #[test]
     fn tooth_revert_restores_the_cone_digest_and_hits_the_cache_ten_years_later() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let store = DiskVerdictStore::open(dir.path());
         let good = cone("tests.test_a", &[("tests/test_a.py", "t"), ("lib/a.py", "good")]);
         let bad = cone("tests.test_a", &[("tests/test_a.py", "t"), ("lib/a.py", "bad")]);
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn tooth_stores_refuse_a_contradicting_or_empty_verdict() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let unit = cone("u", &[("a.py", "1")]);
         let stores: [&dyn VerdictStore; 2] = [&MemoryStore::new(), &DiskVerdictStore::open(dir.path())];
         for store in stores {

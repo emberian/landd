@@ -76,13 +76,30 @@ fn load_signer(config: &LandConfig) -> Result<Option<(String, SigningKey)>, AnyE
 impl Station {
     pub fn open(repo: &Path, config: LandConfig) -> Result<Self, AnyError> {
         let repo_dir = std::fs::canonicalize(repo)?;
+        let git_repo = GitRepo::open(&repo_dir)?.with_network_timeout(Duration::from_secs(config.network_timeout_s));
         let state = config.state_dir()?;
-        fsx::private_dir(&state)?;
         // State inside the repository could be committed, checked out by a
-        // lane, or shown to the units under test.
-        if std::fs::canonicalize(&state)?.starts_with(&repo_dir) {
-            return Err(format!("the state directory {} is inside the repository {}", state.display(), repo_dir.display()).into());
+        // lane, or shown to the units under test. Refuse before creating
+        // directories, and resolve both the worktree root and `.git` so
+        // opening from a subdirectory cannot miss a top-level cache path.
+        let state_real = fsx::canonical_or_missing(&state)?;
+        let mut forbidden = vec![repo_dir.clone()];
+        for query in ["--show-toplevel", "--git-dir", "--git-common-dir"] {
+            if let Ok(out) = git_repo.run_ok(&["rev-parse", query]) {
+                let text = String::from_utf8_lossy(&out);
+                let raw = Path::new(text.trim());
+                let resolved = if raw.is_absolute() { raw.to_path_buf() } else { repo_dir.join(raw) };
+                if let Ok(canon) = std::fs::canonicalize(&resolved) {
+                    if !forbidden.contains(&canon) {
+                        forbidden.push(canon);
+                    }
+                }
+            }
         }
+        if let Some(root) = forbidden.iter().find(|root| state_real.starts_with(root)) {
+            return Err(format!("the state directory {} is inside the repository {}", state.display(), root.display()).into());
+        }
+        fsx::private_dir(&state)?;
         let source: Box<dyn ConeSource + Send + Sync> = match config.cone_source {
             ConeSourceKind::Manifest => Box::new(ManifestCones { manifest: config.unit_manifest.clone() }),
             ConeSourceKind::Python if !config.ast_sweep_enabled => {
@@ -93,7 +110,7 @@ impl Station {
                 cache: Some(BlobFactsCache::open(state.join("facts"))?),
             }),
         };
-        let repo = GitRepo::open(&repo_dir)?.with_network_timeout(Duration::from_secs(config.network_timeout_s));
+        let repo = git_repo;
         let destination = repo.push_destination(&config.remote)?;
         // A runner that cannot isolate as configured is an error here, at
         // start, and so is a key the sandbox would expose or that cannot be read.

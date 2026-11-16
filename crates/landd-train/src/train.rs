@@ -9,8 +9,10 @@ use landd_core::delivery::{
 };
 use landd_core::digest::hex_encode;
 use landd_core::git::{canonical_repo_id, GitError, GitRepo, MergeOutcome};
-use landd_core::reasons::{judge, Blocker, JudgePolicy, MemoryStore, Observation, Side, Slot, Status, StoreError, VerdictStore};
-use landd_core::{Digest32, Isolation, LandConfig, Oid};
+use landd_core::reasons::{
+    judge, Blocker, Input, JudgePolicy, MemoryStore, Observation, Side, Slot, Status, StoreError, VerdictStore,
+};
+use landd_core::{Digest32, Isolation, LandConfig, Oid, UnitView};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -173,7 +175,7 @@ pub struct Train<'a> {
     /// `(key_id, key)` for sealing land receipts.
     signer: Option<(String, SigningKey)>,
     session: MemoryStore,
-    memo: Mutex<HashMap<Oid, Arc<UnitCones>>>,
+    memo: Mutex<HashMap<(Oid, Oid), Arc<UnitCones>>>,
 }
 
 impl<'a> Train<'a> {
@@ -214,11 +216,29 @@ impl<'a> Train<'a> {
     }
 
     fn cones_at(&self, commit: &Oid, base: &Oid) -> Result<Arc<UnitCones>, String> {
-        if let Some(hit) = self.memo.lock().expect("cone memo").get(commit) {
+        if let Some(hit) = self.memo.lock().expect("cone memo").get(&(*commit, *base)) {
             return Ok(hit.clone());
         }
-        let cones = Arc::new(self.cones.cones(self.repo, commit, base, &self.runner.profile().digest)?);
-        self.memo.lock().expect("cone memo").insert(*commit, cones.clone());
+        let mut cones = self.cones.cones(self.repo, commit, base, &self.runner.profile().digest)?;
+        // A whole-tree process may observe every tracked path, even when the
+        // declared or inferred cone is narrower. Bind its verdict to the view
+        // it actually receives; changing only the profile's view label is not
+        // enough to invalidate a verdict when an undeclared file changes.
+        if self.runner.unit_view() == UnitView::Tree && !cones.cones.is_empty() {
+            let inputs: std::collections::BTreeMap<_, _> = self
+                .repo
+                .ls_tree(&commit.to_hex(), false)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|entry| (entry.path, Input { mode: entry.mode, oid: entry.oid }))
+                .collect();
+            for cone in cones.cones.values_mut() {
+                cone.inputs = inputs.clone();
+                cone.tainted = true;
+            }
+        }
+        let cones = Arc::new(cones);
+        self.memo.lock().expect("cone memo").insert((*commit, *base), cones.clone());
         Ok(cones)
     }
 
@@ -270,15 +290,40 @@ impl<'a> Train<'a> {
             return Ok(None);
         };
         let binding = stored.delivery.binding.clone();
+        // A caller may hold a stale base. Destination completion dominates
+        // every local state, including a refusal limit, and must leave the
+        // batch before re-composition can misreport an already delivered lane.
+        let head = self.forge_head()?;
+        if self.repo.is_ancestor(&candidate.tip, &head)? {
+            let evidence = self.evidence(&head, &candidate.tip);
+            self.journal.transition(&binding, |d| d.complete(evidence.clone()))?;
+            if self.repo.is_ancestor(&candidate.tip, base)? {
+                return Ok(Some(CandidateOutcome::OnBase { evidence }));
+            }
+            // Preserve the landed/carried distinction without running checks
+            // or attempting another push. A singleton composition identifies
+            // this train's deterministic merge; otherwise the destination is
+            // the observed carrier, including if the stale base now conflicts.
+            let who = Committer { name: self.config.committer_name.clone(), email: self.config.committer_email.clone() };
+            let own_merge = compose(self.repo, base, std::slice::from_ref(candidate), &who)
+                .ok()
+                .and_then(|chain| chain.links.first().map(|link| link.merge));
+            if let Some(merge) = own_merge {
+                if self.repo.is_ancestor(&merge, &head)? {
+                    return Ok(Some(CandidateOutcome::Landed { merge, evidence }));
+                }
+            }
+            return Ok(Some(CandidateOutcome::Carried { carrier: head, evidence }));
+        }
         match stored.delivery.state {
             DeliveryState::Unknown => {
-                // Ask the destination, not the base the caller read earlier.
-                let head = self.forge_head()?;
-                if self.repo.is_ancestor(&candidate.tip, &head)? {
-                    let evidence = self.evidence(&head, &candidate.tip);
-                    self.journal.transition(&binding, |d| d.complete(evidence.clone()))?;
-                } else {
-                    self.journal.transition(&binding, |d| d.refused(now))?;
+                let settled = self.journal.transition(&binding, |d| d.refused(now))?;
+                if settled.delivery.sends >= self.config.max_refusals {
+                    let evidence = DeclineEvidence::RefusalsExhausted { attempts: settled.delivery.sends };
+                    self.journal.transition(&binding, |d| d.declined(evidence.clone()))?;
+                    if binding.expected_old == *base {
+                        return Ok(Some(CandidateOutcome::Declined { evidence }));
+                    }
                 }
                 Ok(None)
             }
@@ -784,7 +829,7 @@ mod tests {
 
     impl Fixture {
         fn new(files: &[(&str, &str)]) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = landd_core::git::testkit::private_tempdir().unwrap();
             let sandbox = Sandbox::new(dir.path(), files);
             let config = LandConfig {
                 cache_dir: Some(dir.path().join("state")),
@@ -1044,6 +1089,70 @@ mod tests {
         assert!(fx.repo.is_ancestor(&lost.tip, &fx.forge()).unwrap());
     }
 
+    /// An already delivered lane cannot become a new red merely because
+    /// this caller still has the old base or a local refusal in its journal.
+    #[test]
+    fn tooth_destination_completion_wins_over_stale_base_and_local_refusals() {
+        for prior in ["unknown", "refused", "declined", "completed"] {
+            let fx = Fixture::new(&base_files());
+            let base = fx.forge();
+            let lane = fx.lane("arrived", &[("src/a.txt", "broken\n")]);
+            let train = fx.train();
+            let who = Committer { name: fx.config.committer_name.clone(), email: fx.config.committer_email.clone() };
+            let merge = compose(&fx.repo, &base, std::slice::from_ref(&lane), &who).unwrap().tip();
+            let binding = train.binding(&base, &lane.tip, merge);
+            fx.journal.note_tip(&binding).unwrap();
+            fx.journal.transition(&binding, |d| d.start(NOW)).unwrap();
+            match prior {
+                "refused" => {
+                    fx.journal.transition(&binding, |d| d.refused(NOW + 100)).unwrap();
+                }
+                "declined" => {
+                    fx.journal.transition(&binding, |d| d.refused(NOW)).unwrap();
+                    fx.journal.transition(&binding, |d| d.declined(DeclineEvidence::RefusalsExhausted { attempts: 1 })).unwrap();
+                }
+                "completed" => {
+                    fx.journal.transition(&binding, |d| d.complete(train.evidence(&merge, &lane.tip))).unwrap();
+                }
+                _ => {}
+            }
+            // Another writer delivered the lane. Its test would be a new red
+            // against our stale base, but the destination already contains it.
+            fx.sandbox.git(&["push", "--quiet", "origin", &format!("{merge}:{MAIN}")]);
+            let report = train.land_on(&base, std::slice::from_ref(&lane), true, NOW + 1).unwrap();
+            assert_eq!(
+                report.outcome_of("arrived"),
+                Some(&CandidateOutcome::Landed { merge, evidence: train.evidence(&merge, &lane.tip) }),
+                "prior state: {prior}"
+            );
+            assert_eq!(report.pushed, None);
+            assert_eq!(report.tally.candidate_units_run, 0);
+            assert_eq!(fx.forge(), merge);
+            let settled = fx.journal.load(&binding).unwrap().delivery;
+            assert_eq!(settled.sends, 1);
+            assert!(matches!(settled.state, DeliveryState::Completed { .. }));
+        }
+    }
+
+    #[test]
+    fn tooth_settling_an_unread_send_at_max_refusals_declines_without_resending() {
+        let mut fx = Fixture::new(&base_files());
+        fx.config.max_refusals = 1;
+        let base = fx.forge();
+        let lane = fx.lane("capped", &[("src/a.txt", "ok capped\n")]);
+        let train = fx.train();
+        let who = Committer { name: fx.config.committer_name.clone(), email: fx.config.committer_email.clone() };
+        let merge = compose(&fx.repo, &base, std::slice::from_ref(&lane), &who).unwrap().tip();
+        let binding = train.binding(&base, &lane.tip, merge);
+        fx.journal.note_tip(&binding).unwrap();
+        fx.journal.transition(&binding, |d| d.start(NOW)).unwrap();
+
+        let report = fx.train().land_batch(std::slice::from_ref(&lane), true, NOW + 10).unwrap();
+        assert_eq!(declined(&report, "capped"), DeclineEvidence::RefusalsExhausted { attempts: 1 });
+        assert_eq!(report.pushed, None);
+        assert_eq!(fx.journal.load(&binding).unwrap().delivery.sends, 1);
+    }
+
     /// The lease refuses the push, but the destination already holds the
     /// lane tip because someone else's push carried it: the delivery
     /// completes (`confirmation_wins`) and is reported as carried, not landed.
@@ -1057,8 +1166,9 @@ mod tests {
         let carried_by = fx.forge();
 
         let report = train.land_on(&stale_base, std::slice::from_ref(&lane), true, NOW + 1).unwrap();
-        // Identical inputs give the identical merge, so this "second" push is the first one: landed.
-        landed(&report, "lane");
+        // Identical inputs identify the already delivered merge without a second push.
+        let original_merge = landed(&report, "lane");
+        assert_eq!(report.pushed, None);
 
         // A different train identity composes a different merge of the same lane.
         let mut other = fx.config.clone();
@@ -1071,8 +1181,8 @@ mod tests {
         };
         assert_eq!((*carrier, evidence.remote_head), (carried_by, carried_by));
         assert_eq!(fx.forge(), carried_by);
-        let merged = report.pushed.unwrap();
-        assert!(matches!(fx.state(&train, &stale_base, &lane.tip, merged), DeliveryState::Completed { .. }));
+        assert_eq!(report.pushed, None, "destination completion needs no second send");
+        assert!(matches!(fx.state(&train, &stale_base, &lane.tip, original_merge), DeliveryState::Completed { .. }));
 
         // And a tip that is already on the base has nothing to land.
         let again = train.land_batch(std::slice::from_ref(&lane), true, NOW + 3).unwrap();
@@ -1220,6 +1330,29 @@ mod tests {
         fx.config.isolation = Isolation::None;
         let refused = fx.train().with_signer("seat-1", SigningKey::ed25519_from_seed([42; 32]));
         assert!(matches!(refused, Err(TrainError::UnsandboxedSigning)));
+    }
+
+    /// A whole-tree view cannot reuse a narrow cone while a visible input
+    /// changes. Exercise admission, the sandboxed check and the actual forge.
+    #[test]
+    fn tooth_whole_tree_views_bind_every_visible_input() {
+        let mut fx = Fixture::new(&[
+            ("landd-units.json", r#"{"units":{"check":{"path":"check.sh","inputs":[]}}}"#),
+            ("check.sh", "grep -q '^ok' undeclared.txt\n"),
+            ("undeclared.txt", "ok base\n"),
+        ]);
+        fx.config.unit_view = UnitView::Tree;
+        let good = fx.lane("good", &[("undeclared.txt", "ok changed\n")]);
+        let bad = fx.lane("bad", &[("undeclared.txt", "broken\n")]);
+        let train = fx.train();
+        let first = train.land_batch(&[good], false, NOW).unwrap();
+        assert!(matches!(first.outcome_of("good"), Some(CandidateOutcome::WouldLand { .. })));
+        assert_eq!(first.tally.candidate_units_run, 1);
+        let head = fx.forge();
+        let report = train.land_batch(&[bad], true, NOW + 1).unwrap();
+        assert_eq!(report.tally.candidate_units_run, 1);
+        assert_eq!(blockers(&declined(&report, "bad"))[0].moved_paths, ["undeclared.txt"]);
+        assert_eq!(fx.forge(), head, "the red must not reach the forge");
     }
 
     #[test]

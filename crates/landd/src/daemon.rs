@@ -13,7 +13,7 @@
 
 use crate::station::Station;
 use crate::wire::{read_frame, write_frame, Request, Response, Settled, Waiting, MAX_FRAME, MAX_REQUEST};
-use landd_core::Oid;
+use landd_core::{fsx, git::canonical_repo_id, Oid};
 use landd_train::{valid_lane, Candidate, Pushed, Queue};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -56,14 +56,18 @@ impl Shared {
     /// Save what is waiting and what is in flight. A lane in flight when
     /// the daemon dies is tried again after a restart; the delivery journal
     /// makes that safe.
-    fn persist(&self, state: &State) {
+    fn persist(&self, state: &State) -> io::Result<()> {
         let mut saved = state.queue.clone();
         for candidate in &state.running {
-            saved.push(candidate.clone(), 0, 0);
+            // A newer submission may be waiting while the old tip runs.
+            // Restart must retain that newer tip, not replace it with the old one.
+            if !saved.waiting().any(|waiting| waiting.lane == candidate.lane) {
+                saved.push(candidate.clone(), 0, 0);
+            }
         }
-        if let Err(err) = saved.save(&self.queue_path) {
-            eprintln!("landd daemon: could not save the queue to {}: {err}", self.queue_path.display());
-        }
+        saved.save(&self.queue_path).map_err(|err| {
+            io::Error::new(err.kind(), format!("could not durably save queue {}: {err}", self.queue_path.display()))
+        })
     }
 }
 
@@ -108,11 +112,15 @@ fn respond(station: &Station, shared: &Shared, request: Request) -> Response {
                 Err(message) => return Response::Error { message },
             };
             let mut state = shared.state.lock().expect("daemon state");
+            let before = state.queue.clone();
             let in_flight = state.running.iter().any(|c| c.tip == tip);
             let pushed =
                 if in_flight { Pushed::Duplicate } else { state.queue.push(Candidate { lane, tip }, shared.now_ms(), 0) };
             let depth = state.queue.len();
-            shared.persist(&state);
+            if let Err(err) = shared.persist(&state) {
+                state.queue = before;
+                return Response::Error { message: err.to_string() };
+            }
             drop(state);
             shared.wake.notify_all();
             Response::Enqueued {
@@ -248,19 +256,19 @@ impl Drop for StopListening<'_> {
 }
 
 /// Take batches as the queue's departure rule releases them, until shutdown.
-fn run_train(station: &Station, shared: &Shared) {
+fn run_train(station: &Station, shared: &Shared) -> io::Result<()> {
     let history = station.config.settled_history;
     loop {
         let batch = {
             let mut state = shared.state.lock().expect("daemon state");
             loop {
                 if state.shutdown {
-                    return;
+                    return Ok(());
                 }
                 let (now_ms, now_s) = (shared.now_ms(), unix_now());
                 if let Some(batch) = state.queue.take_batch(now_ms, now_s, &station.config) {
                     state.running = batch.clone();
-                    shared.persist(&state);
+                    shared.persist(&state)?;
                     break batch;
                 }
                 let nap = state.queue.due_in_ms(now_ms, now_s, &station.config).unwrap_or(60_000).clamp(1, 60_000);
@@ -300,18 +308,33 @@ fn run_train(station: &Station, shared: &Shared) {
                 }
             }
         }
-        shared.persist(&state);
+        shared.persist(&state)?;
     }
 }
 
 pub fn serve(socket: &Path, station: &Station) -> io::Result<()> {
+    let repo_id = station.config.repo_id.clone().unwrap_or_else(|| canonical_repo_id(&station.destination));
+    let queue_path = Queue::path_for(&station.state, &repo_id, &station.config.target_ref);
+    fsx::private_dir(queue_path.parent().expect("queue has a parent"))?;
+    // Different socket names must not create two writers of the same queue.
+    let _queue_lock = lock_file(&queue_path.with_extension("lock"))?;
+    let legacy = station.state.join("queue.json");
+    if !Queue::load(&legacy)?.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unbound legacy queue {} is not empty; stop the old daemon, verify each lane and tip belongs to repository {:?} and target {:?}, then move the legacy file to {} (create its parent directory first)",
+                legacy.display(),
+                repo_id,
+                station.config.target_ref,
+                queue_path.display()
+            ),
+        ));
+    }
+    let queue = Queue::load(&queue_path)?;
     // One daemon per socket, for as long as this file is held locked.
     let lock_path = PathBuf::from(format!("{}.lock", socket.display()));
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&lock_path)?;
-    // SAFETY: `flock` on a descriptor this function owns; no memory is involved.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("another daemon holds {}", lock_path.display())));
-    }
+    let _socket_lock = lock_file(&lock_path)?;
     // Under the lock, a socket file left behind belongs to nobody. Anything
     // else at that path is not ours to delete.
     match std::fs::symlink_metadata(socket) {
@@ -332,8 +355,6 @@ pub fn serve(socket: &Path, station: &Station) -> io::Result<()> {
     };
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
 
-    let queue_path = station.state.join("queue.json");
-    let queue = Queue::load(&queue_path)?;
     let shared = Shared {
         state: Mutex::new(State { queue, ..State::default() }),
         wake: Condvar::new(),
@@ -342,7 +363,7 @@ pub fn serve(socket: &Path, station: &Station) -> io::Result<()> {
         queue_path,
     };
     let limit = station.config.max_connections;
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         let (shared, listener) = (&shared, &listener);
         scope.spawn(move || {
             for stream in listener.incoming() {
@@ -363,10 +384,26 @@ pub fn serve(socket: &Path, station: &Station) -> io::Result<()> {
             }
         });
         let _stop = StopListening { shared, socket };
-        run_train(station, shared);
+        run_train(station, shared)
     });
-    drop(lock);
-    std::fs::remove_file(socket)
+    let cleanup = std::fs::remove_file(socket);
+    result?;
+    cleanup
+}
+
+fn lock_file(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: `flock` on a descriptor this function owns; no memory is involved.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("another daemon holds {}", path.display())));
+    }
+    Ok(file)
 }
 
 pub fn call(socket: &Path, request: &Request) -> io::Result<Response> {
@@ -379,6 +416,18 @@ pub fn call(socket: &Path, request: &Request) -> io::Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use landd_core::git::testkit::Sandbox;
+    use landd_core::{ConeSourceKind, Isolation, LandConfig};
+
+    fn shared(path: PathBuf, state: State) -> Shared {
+        Shared {
+            state: Mutex::new(state),
+            wake: Condvar::new(),
+            started: Instant::now(),
+            connections: AtomicUsize::new(0),
+            queue_path: path,
+        }
+    }
 
     /// The history kept for `status` is a ring: it never grows past its
     /// bound, and sequence numbers keep counting across evictions.
@@ -393,5 +442,93 @@ mod tests {
         let kept: Vec<(u64, &str)> = state.settled.iter().map(|s| (s.seq, s.lane.as_str())).collect();
         assert_eq!(kept, [(9997, "lane-9997"), (9998, "lane-9998"), (9999, "lane-9999")]);
         assert_eq!(state.next_seq, 10_000);
+    }
+
+    #[test]
+    fn tooth_failed_persistence_is_not_acknowledged_on_the_socket() {
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), &[("a", "base")]);
+        let tip = sandbox.lane("lane", "main", &[("a", "new")]);
+        let config = LandConfig {
+            cache_dir: Some(dir.path().join("state")),
+            isolation: Isolation::None,
+            cone_source: ConeSourceKind::Manifest,
+            test_command: vec!["sh".into(), "{path}".into()],
+            ..LandConfig::default()
+        };
+        let station = Station::open(&sandbox.work, config).unwrap();
+        // A directory at the destination gives a deterministic rename failure,
+        // including when the test is run as root.
+        let blocked = dir.path().join("blocked.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let shared = shared(blocked, State::default());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        write_frame(&mut client, &Request::Enqueue { lane: "lane".into(), tip: Some(tip.to_hex()) }).unwrap();
+        converse(&station, &shared, server);
+        let response: Response = read_frame(&mut client, MAX_FRAME).unwrap();
+        assert!(matches!(response, Response::Error { message } if message.contains("durably save queue")));
+        assert!(shared.state.lock().unwrap().queue.is_empty(), "failed enqueue must not start in memory");
+        assert_eq!(sandbox.forge_head("refs/heads/main"), station.repo.rev_parse("main").unwrap());
+    }
+
+    #[test]
+    fn tooth_restart_preserves_newer_queued_tip_over_older_running_tip() {
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
+        let old = Candidate { lane: "lane".into(), tip: Oid::from_slice(&[1; 20]).unwrap() };
+        let new = Candidate { lane: "lane".into(), tip: Oid::from_slice(&[2; 20]).unwrap() };
+        let other = Candidate { lane: "other".into(), tip: Oid::from_slice(&[3; 20]).unwrap() };
+        let mut state = State { running: vec![old, other.clone()], ..State::default() };
+        state.queue.push(new.clone(), 0, 99);
+        let shared = shared(dir.path().join("queue.json"), state);
+        shared.persist(&shared.state.lock().unwrap()).unwrap();
+        let mut restored = Queue::load(&shared.queue_path).unwrap();
+        assert_eq!(restored.waiting().collect::<Vec<_>>(), [new.clone(), other.clone()]);
+        assert_eq!(restored.take_batch(0, 98, &LandConfig::default()).unwrap(), [other]);
+        assert_eq!(restored.take_batch(0, 99, &LandConfig::default()).unwrap(), [new]);
+    }
+
+    #[test]
+    fn tooth_destination_queues_are_distinct_and_single_writer() {
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
+        let first = Queue::path_for(dir.path(), "repo-a", "refs/heads/main");
+        let second = Queue::path_for(dir.path(), "repo-b", "refs/heads/main");
+        let release = Queue::path_for(dir.path(), "repo-a", "refs/heads/release");
+        assert_ne!(first, second);
+        assert_ne!(first, release);
+        fsx::private_dir(first.parent().unwrap()).unwrap();
+        let lock_path = first.with_extension("lock");
+        let held = lock_file(&lock_path).unwrap();
+        assert_eq!(lock_file(&lock_path).unwrap_err().kind(), io::ErrorKind::AddrInUse);
+        drop(held);
+        assert!(lock_file(&lock_path).is_ok());
+    }
+
+    #[test]
+    fn tooth_nonempty_unbound_legacy_queue_is_preserved_and_refused() {
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), &[("a", "base")]);
+        let config = LandConfig {
+            cache_dir: Some(dir.path().join("state")),
+            isolation: Isolation::None,
+            cone_source: ConeSourceKind::Manifest,
+            test_command: vec!["sh".into(), "{path}".into()],
+            ..LandConfig::default()
+        };
+        let station = Station::open(&sandbox.work, config).unwrap();
+        let legacy = station.state.join("queue.json");
+        let mut queue = Queue::new();
+        queue.push(Candidate { lane: "lane".into(), tip: station.repo.rev_parse("main").unwrap() }, 0, 0);
+        queue.save(&legacy).unwrap();
+        let bytes = std::fs::read(&legacy).unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let error = serve(&socket, &station).unwrap_err().to_string();
+        assert!(
+            error.contains("unbound legacy queue")
+                && error.contains("verify each lane and tip")
+                && error.contains("refs/heads/main"),
+            "{error}"
+        );
+        assert!(!socket.exists());
+        assert_eq!(std::fs::read(legacy).unwrap(), bytes);
     }
 }

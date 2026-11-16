@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn blob_entries_round_trip_at_sharded_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let cache = BlobFactsCache::open(dir.path().join("c")).unwrap();
         let (oid, facts) = sample();
         assert_eq!(cache.get_blob(FileKind::Python, &oid), None);
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn tooth_entries_have_no_expiry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let cache = BlobFactsCache::open(dir.path().join("c")).unwrap();
         let (oid, facts) = sample();
         cache.put_blob(FileKind::Python, &oid, &facts).unwrap();
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn tooth_torn_or_tampered_entries_are_misses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let cache = BlobFactsCache::open(dir.path().join("c")).unwrap();
         let (oid, facts) = sample();
         cache.put_blob(FileKind::Python, &oid, &facts).unwrap();

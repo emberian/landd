@@ -205,6 +205,8 @@ pub struct Runner {
     /// Absolute path of `bwrap`, when sandboxing.
     bwrap: Option<PathBuf>,
     profile: RunnerProfile,
+    /// The exact allowlisted environment hashed into `profile`.
+    env: BTreeMap<String, String>,
 }
 
 /// The executable a bare program name resolves to on `path`.
@@ -215,6 +217,28 @@ fn which(program: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     std::env::split_paths(path?)
         .map(|dir| dir.join(program))
         .find(|candidate| std::fs::metadata(candidate).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0))
+}
+
+/// Kills a process-group leader's group and reaps the leader on drop unless
+/// `wait_deadline` already did so.
+struct GroupGuard(Option<Child>);
+
+impl GroupGuard {
+    fn wait_deadline(mut self, deadline: Instant) -> Option<ExitStatus> {
+        let mut child = self.0.take()?;
+        wait_deadline(&mut child, deadline)
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let pid = child.id() as libc::pid_t;
+            // SAFETY: signals the process group the un-reaped child leads.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Run a short command and return its output, or `None` past the deadline.
@@ -229,16 +253,20 @@ fn probe(argv: &[String], env: &BTreeMap<String, String>) -> Option<(Option<i32>
         .process_group(0)
         .spawn()
         .ok()?;
-    let (mut out, mut err) = (child.stdout.take()?, child.stderr.take()?);
+    let (out, err) = (child.stdout.take(), child.stderr.take());
+    let guard = GroupGuard(Some(child));
+    let (mut out, mut err) = (out?, err?);
     let merged = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = (&mut out).take(1 << 16).read_to_end(&mut bytes);
         let _ = (&mut err).take(1 << 16).read_to_end(&mut bytes);
         bytes
     });
-    let status = wait_deadline(&mut child, Instant::now() + Duration::from_secs(30))?;
+    let status = guard.wait_deadline(Instant::now() + Duration::from_secs(30))?;
     Some((status.code(), merged.join().unwrap_or_default()))
 }
+
+use landd_core::fsx::canonical_or_missing;
 
 impl Runner {
     /// Build a runner, checking up front that it can do what its
@@ -265,30 +293,8 @@ impl Runner {
             // or state directory below a mounted directory would be too.
             for mount in config.sandbox_ro.iter().filter_map(|dir| std::fs::canonicalize(dir).ok()) {
                 for secret in &config.secrets {
-                    // `..` is resolved by spelling first; then a path that does not
-                    // exist yet is judged by its nearest existing ancestor.
-                    let mut spelled = PathBuf::new();
-                    for part in secret.components() {
-                        match part {
-                            std::path::Component::ParentDir => {
-                                spelled.pop();
-                            }
-                            std::path::Component::CurDir => {}
-                            other => spelled.push(other),
-                        }
-                    }
-                    let secret = &spelled;
-                    let mut probe = secret.as_path();
-                    let real = loop {
-                        match std::fs::canonicalize(probe) {
-                            Ok(real) => break Some(real.join(secret.strip_prefix(probe).unwrap_or(Path::new("")))),
-                            Err(_) => match probe.parent() {
-                                Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
-                                _ => break None,
-                            },
-                        }
-                    };
-                    if real.is_some_and(|real| real.starts_with(&mount)) {
+                    let real = canonical_or_missing(secret).map_err(io_at(secret))?;
+                    if real.starts_with(&mount) {
                         return Err(RunnerError::Exposed { secret: secret.clone(), mount });
                     }
                 }
@@ -321,7 +327,7 @@ impl Runner {
         });
         let canonical = landd_core::canonical_json(&description).map_err(|e| RunnerError::Profile(e.to_string()))?;
         let profile = RunnerProfile { digest: Digest32::tagged("landd runner profile v1", &[&canonical]), description };
-        let runner = Self { config, bwrap, profile };
+        let runner = Self { config, bwrap, profile, env };
         if runner.bwrap.is_some() {
             runner.check_sandbox()?;
         }
@@ -379,8 +385,7 @@ impl Runner {
 
     /// The environment a unit sees, besides what the allowlist passes on.
     fn unit_env(&self, unit: &str, home: &str, tmp: &str, frame: &str) -> Vec<(String, String)> {
-        let mut env: Vec<(String, String)> =
-            self.config.env_allow.iter().filter_map(|name| Some((name.clone(), std::env::var(name).ok()?))).collect();
+        let mut env: Vec<(String, String)> = self.env.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
         for (name, value) in [
             ("HOME", home),
             ("TMPDIR", tmp),
@@ -538,6 +543,7 @@ impl Runner {
         // Only the end of stderr is kept; the rest is read and dropped, so a
         // unit cannot fill a disk or stall on a full pipe.
         let mut stderr = child.stderr.take().expect("piped stderr");
+        let guard = GroupGuard(Some(child));
         let tail = std::thread::spawn(move || {
             let mut kept: Vec<u8> = Vec::new();
             let mut buffer = [0u8; 8192];
@@ -550,7 +556,7 @@ impl Runner {
             let start = kept.len().saturating_sub(LOG_TAIL_BYTES);
             String::from_utf8_lossy(&kept[start..]).trim().to_owned()
         });
-        let exit = wait_deadline(&mut child, Instant::now() + self.config.timeout);
+        let exit = guard.wait_deadline(Instant::now() + self.config.timeout);
         // The group is dead, so every write end of the pipe is closed.
         let log_tail = tail.join().unwrap_or_default();
         let outcome = match exit {
@@ -774,7 +780,7 @@ mod tests {
 
     #[test]
     fn outcomes_come_from_exit_codes_and_result_frames() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let files = [
             ("checks/pass.sh", "exit 0\n"),
             ("checks/fail.sh", "echo boom >&2\nexit 3\n"),
@@ -835,7 +841,7 @@ mod tests {
     /// bits and links, whatever `.gitattributes` says about exports.
     #[test]
     fn tooth_materialization_is_exact_and_ignores_export_attributes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let check = "set -e\n[ -f hidden.txt ]\n[ \"$(cat crlf.txt | od -An -c | tr -d ' \\n')\" = 'a\\nb\\n' ]\n\
                      [ -x tool ]\n[ ! -x plain.txt ]\n[ -L link ]\n[ \"$(readlink link)\" = plain.txt ]\n[ \"$(cat ident.txt)\" = '$Id$' ]\n[ ! -e .git ]\n";
         let sandbox = Sandbox::new(
@@ -866,7 +872,7 @@ mod tests {
     /// environment exist for the unit, and what it writes is gone afterwards.
     #[test]
     fn tooth_sandboxed_units_cannot_reach_the_supervisor() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir_all(state.join("verdicts")).unwrap();
         let key = state.join("seat.key.json");
@@ -920,7 +926,7 @@ mod tests {
 
     #[test]
     fn unsandboxed_units_get_a_cleared_environment_and_a_private_copy() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let script = "[ ! -e .git ] || exit 10\n[ -z \"$LANDD_TEST_OTHER_SECRET\" ] || exit 11\n[ \"$LANDD_TEST_ALLOWED\" = yes ] || exit 13\n\
                       [ -z \"$(git rev-parse --show-toplevel 2>/dev/null)\" ] || exit 14\n! grep -q scribble src.txt || exit 15\necho scribble >> src.txt\n";
         let sandbox = Sandbox::new(dir.path(), &[("checks/iso.sh", script), ("src.txt", "s\n")]);
@@ -943,7 +949,7 @@ mod tests {
     /// With cone views a unit sees its inputs and nothing else of the tree.
     #[test]
     fn tooth_cone_views_hold_only_the_units_inputs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let sandbox = Sandbox::new(
             dir.path(),
             &[
@@ -979,7 +985,7 @@ mod tests {
 
     #[test]
     fn tooth_timeouts_kill_the_process_group_and_are_not_durable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let marker = dir.path().join("survivor");
         let script = format!("(sleep 2; touch {}) &\nsleep 30\n", marker.display());
         let sandbox = Sandbox::new(dir.path(), &[("checks/slow.sh", script.as_str())]);
@@ -1002,7 +1008,7 @@ mod tests {
     /// and an enormous file must not hang or exhaust the supervisor.
     #[test]
     fn tooth_hostile_result_files_do_not_hang_or_exhaust_the_supervisor() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let files = [
             ("checks/zero.sh", "ln -s /dev/zero \"$LANDD_RESULT_FILE\"\nexit 0\n"),
             ("checks/fifo.sh", "mkfifo \"$LANDD_RESULT_FILE\"\nexit 0\n"),
@@ -1033,7 +1039,7 @@ mod tests {
 
     #[test]
     fn flakes_are_rerun_from_a_pristine_view_and_never_recorded_as_durable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let marker = dir.path().join("second-time");
         // Unsandboxed, so the script can leave a marker outside its view.
         let flaky = format!("[ -e {0} ] && exit 0\ntouch {0}\nexit 1\n", marker.display());
@@ -1051,7 +1057,7 @@ mod tests {
 
     #[test]
     fn tooth_a_runner_that_cannot_keep_its_promises_does_not_start() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let missing = Runner::new(config(dir.path(), Isolation::None, |c| c.command = vec!["landd-no-such-program".into()]));
         assert!(matches!(missing, Err(RunnerError::Profile(_))));
         // A sandbox was asked for and cannot be had: an error, not a quiet fallback.
@@ -1066,7 +1072,7 @@ mod tests {
     /// environment value, view or sandbox is another profile.
     #[test]
     fn tooth_the_runner_profile_moves_with_what_produces_verdicts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         std::env::set_var("LANDD_TEST_PROFILE_VAR", "one");
         let base = runner(dir.path(), Isolation::None, |c| c.env_allow.push("LANDD_TEST_PROFILE_VAR".into())).profile().digest;
         let same = runner(dir.path(), Isolation::None, |c| c.env_allow.push("LANDD_TEST_PROFILE_VAR".into())).profile().digest;
@@ -1091,12 +1097,27 @@ mod tests {
         assert_ne!(base, moved);
     }
 
+    #[test]
+    fn tooth_units_receive_the_environment_that_was_profiled() {
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), &[("checks/env.sh", "[ \"$LANDD_TEST_FROZEN_ENV\" = before ]\n")]);
+        let repo = sandbox.repo();
+        for isolation in BOTH {
+            std::env::set_var("LANDD_TEST_FROZEN_ENV", "before");
+            let runner = runner(dir.path(), isolation, |c| c.env_allow.push("LANDD_TEST_FROZEN_ENV".into()));
+            std::env::set_var("LANDD_TEST_FROZEN_ENV", "after");
+            let run = runner.run_units(&repo, &repo.tree_of("HEAD").unwrap(), &jobs(&["env"])).unwrap();
+            assert_eq!(run[0].outcome, RunOutcome::Pass, "{isolation:?}: {}", run[0].log_tail);
+        }
+        std::env::remove_var("LANDD_TEST_FROZEN_ENV");
+    }
+
     /// Moving scratch out of the state directory is not enough if the key
     /// itself sits under a directory the sandbox mounts (the default mounts
     /// include `/etc`): such a configuration does not start.
     #[test]
     fn tooth_a_secret_under_a_sandbox_mount_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
         let mounted = dir.path().join("etc-like");
         std::fs::create_dir_all(mounted.join("landd")).unwrap();
         let key = mounted.join("landd/seat.key.json");
@@ -1112,6 +1133,19 @@ mod tests {
         assert!(matches!(exposed(mounted.join("landd/state/not-yet")), Err(RunnerError::Exposed { .. })));
         assert!(matches!(exposed(dir.path().join("x/../etc-like/landd/seat.key.json")), Err(RunnerError::Exposed { .. })));
         assert!(matches!(exposed(PathBuf::from("/etc/landd/seat.key.json")), Err(RunnerError::Exposed { .. })));
+        // `/outside/link/../seat.key.json` resolves through the symlink
+        // before `..`; lexical normalization would miss the mounted key.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(mounted.join("landd/nested")).unwrap();
+        std::os::unix::fs::symlink(mounted.join("landd/nested"), outside.join("link")).unwrap();
+        let aliased_key = outside.join("link/../seat.key.json");
+        assert_eq!(std::fs::read(&aliased_key).unwrap(), b"{}");
+        assert!(matches!(exposed(aliased_key), Err(RunnerError::Exposed { .. })));
+        assert!(matches!(exposed(outside.join("link/../future/state")), Err(RunnerError::Exposed { .. })));
+        // A dangling symlink into a mounted directory is also refused.
+        std::os::unix::fs::symlink(mounted.join("landd/not-yet"), outside.join("dangling")).unwrap();
+        assert!(matches!(exposed(outside.join("dangling/seat.key.json")), Err(RunnerError::Exposed { .. })));
         // Outside every mount it starts, and the unit cannot see the key.
         std::fs::write(dir.path().join("outside.key"), "{}").unwrap();
         assert!(exposed(dir.path().join("outside.key")).is_ok());

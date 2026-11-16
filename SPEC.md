@@ -24,28 +24,30 @@ This document is the design contract. Where it gives a number, the number is eit
 5. **Out-of-process, isolated test execution.**
    - `isolation = "bwrap"` (default): each unit runs in its own user, mount, pid, ipc and uts namespaces (and network namespace unless configured), seeing read-only system directories, its own view of the tree under a throw-away overlay, a private `/tmp` and home, and one writable directory for its result frame. A signing key or state directory that a sandbox mount would expose is refused at start.
    - `isolation = "none"`: an ordinary child process with a cleared environment. It can read whatever the supervisor's user can. For trusted code only; receipts cannot be signed.
-   - The tree is materialized from the object store with exact blob bytes and git modes (no `git archive`, so no attribute rewriting). With `unit_view = "cone"` a unit sees only its cone's files.
+   - The tree is materialized from the object store with exact blob bytes and git modes (no `git archive`, so no attribute rewriting). With `unit_view = "cone"` a unit sees only its cone's files. With `unit_view = "tree"` every verdict binds the entire tracked tree, even when the static analysis found a narrower cone.
    - Recorded verdicts are valid for one runtime image. `landd` hashes the test program and the output of the configured profile commands, not every library the sandbox mounts; `runtime_id` is the operator's declaration that the image changed.
 6. **Differential admissibility ("no redder than base").**
    - `Observation { unit_id, cone_digest, status }` with `status: Pass | Fail { items } | Crash | Timeout`, keyed by content, never by wall-clock age. The cone digest covers each input's path, git mode and blob, whether the cone was widened, and a context digest (rule pack, runner profile).
    - A candidate is admissible iff every unit of either tree is accounted for: same cone digest as base (transported, 0 runs); `Pass` at the candidate cone; or `Fail { items }` whose items are a subset of the base's `Fail { items }` (inherited). A crash or timeout is not comparable with anything unless the operator sets `inherit_coarse_failures`. A unit present on the base and absent from the candidate blocks unless `allow_unit_removal`.
    - `why_not` names every blocking unit and the input paths that moved under it.
-7. **Every limit is a runtime setting** (`LandConfig` TOML/JSON plus `--set key=value`); see `examples/landd.toml`.
+7. **Operational limits are runtime settings** (`LandConfig` TOML/JSON plus `--set key=value`); see `examples/landd.toml`.
 
 ---
 
 ## 2. Cones
 
-A unit's cone is everything its verdict may depend on. `ast-sweep` builds it statically:
+A cone is a proposed set of repository inputs. `ast-sweep` derives it from recognized Python syntax:
 
-- the import closure of the test and of every `conftest.py` above it, including modules loaded by a literal path and Python child processes with a literal script or `-m` module;
+- the imports reached by the test and every `conftest.py` above it, including literal-path loads and Python child processes with a literal script or `-m` module; module initialization is always included, while imported symbols follow their own recorded dependencies rather than every unused helper;
 - files those modules read as data (opens, existence probes, listings, walks, globs) when the path is built from `__file__`, the working directory or literals;
 - `guards` (unit pattern → paths) and `domains` from a trusted `gateaudits.json`, and the pack's `always` list;
 - what a declared dynamic loader can load, **only while the loader's own source shows a literal prefix the declaration covers**. The check is made on every tree, so an edit to a loader cannot hide behind an old declaration.
 
-Anything else widens the cone to the whole tree, with the cause recorded. Under the default `cone_model = "strict"` that includes every read through a path the analysis cannot follow (a parameter, an attribute, a computed name), every child process that is not a literal Python invocation, every undeclared or unverifiable dynamic load, a file that does not parse, an unresolved relative import, and a symbolic link that leaves the tree. `cone_model = "hermetic"` instead relies on `unit_view = "cone"` to make unaccounted reads fail closed; it is not the default and still widens for scans it cannot bound.
+Recognized reads and loaders that cannot be resolved widen the cone to the whole tree, with the cause recorded. Under the default `cone_model = "strict"` that includes every read through a path the analysis cannot follow (a parameter, an attribute, a computed name), every child process that is not a literal Python invocation, every undeclared or unverifiable dynamic load, a file that does not parse, an unresolved relative import, and a symbolic link that leaves the tree. `cone_model = "hermetic"` instead relies on `unit_view = "cone"` to make unaccounted reads fail closed; it is not the default and still widens for scans it cannot bound.
 
-Static analysis of Python cannot be complete. The contract is: under `strict`, what the analysis cannot bound is treated as a dependency on everything; it is not claimed that a cone is minimal, and on a tree whose shared test support reads the whole tree, every cone is the whole tree (see HARDENING.md for the measured case).
+This analysis does not prove the absence of hidden Python effects. It tracks a finite set of constructs; arbitrary reflection, monkey-patching and runtime plugins can hide inputs from it. The runtime boundary is therefore essential: sandboxed `unit_view = "cone"` exposes only the recorded repository files, and `unit_view = "tree"` binds all tracked files into every verdict. A narrow view can change test behavior; before adopting it, compare the project's actual checks under the original and restricted views. Neither a static cone comparison nor passing synthetic tests establishes that equivalence. External mounted runtime contents still depend on the operator's `runtime_id` contract.
+
+The symbol graph conservatively includes import-time default arguments, class bodies, descriptors, subclass hooks, custom decorators and escaped instances. Direct function calls can propagate known file arguments within a module; externally callable parameters remain opaque. Dynamic introspection and wildcard or bare-module references widen to the relevant module's recorded effects. These are supported cases, not a complete model of Python.
 
 The rule pack is an operator path and is never read from the tree under test. A manifest-declared unit's inputs are the union of what the base's and the candidate's manifests declare.
 
@@ -64,6 +66,8 @@ The rule pack is an operator path and is never read from the tree under test. A 
   - `landd daemon --socket <path> --config <landd.toml>` and `landd ctl --socket <path> enqueue|status|shutdown`
   - `landd replay --ledger <land_runs.jsonl> [--timings <json>] [--module-costs <json>] [--json]`
   - `landd pre-receive --trusted-keys <file> --repo-id <id> [--protect <ref>]…`
+
+Daemon queues are namespaced by canonical destination identity and target ref, with a lifetime writer lock independent of socket name. Enqueue acknowledgments follow durable persistence; a newer queued tip survives an older in-flight snapshot. Nonempty legacy `queue.json` files are preserved and refused with explicit migration instructions. Trusted state requires safe directory ancestry and cannot be placed inside the repository or its Git directories.
 
 The train: compose `T_1..T_k`; a candidate that cannot join (conflict, unmergeable, already on the base, contained in an earlier candidate, no change) leaves the chain without delaying its peers. Judge the tip against the base, running only units whose cones moved. On a new red, split the batch to isolate culprits; a lane that conflicted only with a culprit, or was contained in one, is judged again against the chain that stands. Push once under a lease, read the destination, record what it holds.
 

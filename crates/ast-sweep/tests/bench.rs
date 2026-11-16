@@ -29,7 +29,7 @@ fn bench_in_process_sweeps() {
         None => RulePack::builtin(),
     };
     let repo = GitRepo::open(Path::new(&path)).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = landd_core::git::testkit::private_tempdir().unwrap();
     let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
     let sweep = |rev: &str, cache: &BlobFactsCache| run_sweep(Source::Git { repo: &repo, rev }, &pack, Some(cache)).unwrap().0;
 

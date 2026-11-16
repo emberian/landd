@@ -154,15 +154,131 @@ pub fn shard1(root: &Path, hex: &str, suffix: &str) -> PathBuf {
     root.join(&hex[..2]).join(format!("{hex}{suffix}"))
 }
 
+/// Resolve symlinks before interpreting `..`, exactly as the kernel does,
+/// including when a symlink or final suffix points to a path not yet created.
+pub fn canonical_or_missing(path: &Path) -> io::Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+    let mut queue: VecDeque<std::ffi::OsString> = VecDeque::new();
+    let mut resolved = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::RootDir => resolved.push(Path::new("/")),
+            Component::Prefix(p) => resolved.push(p.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => queue.push_back(std::ffi::OsString::from("..")),
+            Component::Normal(name) => queue.push_back(name.to_owned()),
+        }
+    }
+    let mut hops = 0usize;
+    while let Some(part) = queue.pop_front() {
+        if part == "." || part.is_empty() {
+            continue;
+        }
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&part);
+        match fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > 40 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("too many symbolic links resolving {}", path.display()),
+                    ));
+                }
+                let target = fs::read_link(&candidate)?;
+                let mut prepend = Vec::new();
+                for tpart in target.components() {
+                    match tpart {
+                        Component::RootDir => {
+                            resolved = PathBuf::from("/");
+                        }
+                        Component::Prefix(p) => {
+                            resolved = PathBuf::from(p.as_os_str());
+                        }
+                        Component::CurDir => {}
+                        Component::ParentDir => prepend.push(std::ffi::OsString::from("..")),
+                        Component::Normal(name) => prepend.push(name.to_owned()),
+                    }
+                }
+                for item in prepend.into_iter().rev() {
+                    queue.push_front(item);
+                }
+            }
+            Ok(_) => resolved = candidate,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => resolved = candidate,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Check every directory that can redirect a path-based store operation.
+/// A private leaf is insufficient if another account can rename one of its
+/// ancestors. Root and this user are trusted; sticky shared directories such
+/// as `/tmp` are safe because every following component is also checked for
+/// trusted ownership. Symlink targets and their spelling are both checked.
+#[cfg(unix)]
+fn trusted_directory_path(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` reads the process's effective uid and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let absolute = if dir.is_absolute() { dir.to_owned() } else { std::env::current_dir()?.join(dir) };
+    let mut pending = vec![absolute];
+    let mut checked = std::collections::BTreeSet::new();
+    while let Some(path) = pending.pop() {
+        for ancestor in path.ancestors() {
+            if !checked.insert(ancestor.to_owned()) {
+                continue;
+            }
+            let meta = match fs::symlink_metadata(ancestor) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if meta.uid() != me && meta.uid() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("trusted store ancestor {} is owned by another user", ancestor.display()),
+                ));
+            }
+            if meta.file_type().is_symlink() {
+                pending.push(fs::canonicalize(ancestor)?);
+            } else if !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("trusted store ancestor {} is not a directory", ancestor.display()),
+                ));
+            } else if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "trusted store ancestor {} is writable by group or others without the sticky bit",
+                        ancestor.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create `dir` (and parents) private to this user and refuse a directory
 /// that someone else owns or that group or others can write: whoever can
 /// write a trusted store can forge what it holds.
 #[cfg(unix)]
 pub fn private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    trusted_directory_path(dir)?;
     if !dir.is_dir() {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
+    trusted_directory_path(dir)?;
     let meta = fs::metadata(dir)?;
     // SAFETY: `geteuid` reads the process's effective uid; it has no failure mode.
     let me = unsafe { libc::geteuid() };
@@ -180,8 +296,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tooth_private_store_requires_trusted_ancestors() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let dir = crate::git::testkit::private_tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::DirBuilder::new().mode(0o755).create(&shared).unwrap();
+        let store = shared.join("store");
+        private_dir(&store).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_dir(&store).is_err(), "a private leaf cannot protect its directory entry");
+        assert!(private_dir(&shared.join("not-created")).is_err());
+        assert!(!shared.join("not-created").exists());
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o777,
+            "validation must not change somebody else's directory mode"
+        );
+        // The normal sticky shared-directory contract still works.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        private_dir(&store).unwrap();
+        // A trusted symlink spelling cannot hide an unsafe target ancestor.
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&store, &alias).unwrap();
+        private_dir(&alias).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_dir(&alias).is_err());
+        // Nor can a safe target hide an unsafe ancestor of its spelling.
+        let safe = dir.path().join("safe");
+        private_dir(&safe).unwrap();
+        let link = shared.join("safe-link");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        assert!(private_dir(&link).is_err());
+    }
+
+    #[test]
     fn create_exclusive_never_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let path = shard2(dir.path(), "abcdef", ".json");
         assert!(create_exclusive(&path, b"first").unwrap());
         assert!(!create_exclusive(&path, b"second").unwrap());
@@ -191,7 +341,7 @@ mod tests {
 
     #[test]
     fn replace_and_read_optional() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let path = shard1(dir.path(), "abcdef", ".bin");
         assert_eq!(read_optional(&path).unwrap(), None);
         replace_atomic(&path, b"one", false).unwrap();
@@ -201,7 +351,7 @@ mod tests {
 
     #[test]
     fn tooth_stale_temporaries_do_not_block_writers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let path = dir.path().join("record.json");
         // What a crashed writer with any pid and counter could have left.
         for n in 0..64u64 {
@@ -217,7 +367,7 @@ mod tests {
 
     #[test]
     fn create_dirs_is_idempotent_and_nested() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let deep = dir.path().join("a/b/c/d");
         create_dirs(&deep, true).unwrap();
         create_dirs(&deep, true).unwrap();
@@ -232,7 +382,7 @@ mod tests {
     /// is synced by every writer, not only by the one that created it.
     #[test]
     fn tooth_every_writer_syncs_the_directory_chain_it_relies_on() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let leaf = dir.path().join("store/bindings/ab/cd/key");
         // Writer A created the chain and died before syncing anything.
         fs::create_dir_all(&leaf).unwrap();
@@ -264,7 +414,7 @@ mod tests {
     #[test]
     fn tooth_private_dir_refuses_group_or_world_writable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::git::testkit::private_tempdir().unwrap();
         let store = dir.path().join("store");
         private_dir(&store).unwrap();
         assert_eq!(fs::metadata(&store).unwrap().permissions().mode() & 0o777, 0o700);
@@ -273,5 +423,26 @@ mod tests {
         assert!(private_dir(&store).is_err());
         fs::set_permissions(&store, fs::Permissions::from_mode(0o750)).unwrap();
         private_dir(&store).unwrap();
+    }
+
+    #[test]
+    fn tooth_canonical_or_missing_resolves_symlinks_before_parent_and_dangling_links() {
+        let dir = crate::git::testkit::private_tempdir().unwrap();
+        let real_root = fs::canonicalize(dir.path()).unwrap();
+        let mounted = real_root.join("mounted/nested");
+        fs::create_dir_all(&mounted).unwrap();
+        let outside = real_root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&mounted, outside.join("link")).unwrap();
+        assert_eq!(canonical_or_missing(&outside.join("link/../future/state")).unwrap(), real_root.join("mounted/future/state"));
+
+        // A dangling symlink pointing under a mounted root is still resolved.
+        std::os::unix::fs::symlink(real_root.join("mounted/not-yet"), outside.join("dangling")).unwrap();
+        assert_eq!(canonical_or_missing(&outside.join("dangling/key.json")).unwrap(), real_root.join("mounted/not-yet/key.json"));
+
+        // A symlink loop fails closed instead of spinning.
+        std::os::unix::fs::symlink(outside.join("b"), outside.join("a")).unwrap();
+        std::os::unix::fs::symlink(outside.join("a"), outside.join("b")).unwrap();
+        assert!(canonical_or_missing(&outside.join("a/state")).is_err());
     }
 }

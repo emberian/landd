@@ -42,10 +42,12 @@ pub fn receipts(push_options: &[String]) -> Vec<CustodyEnvelopeV2> {
         .collect()
 }
 
-/// Every update of a protected ref needs a receipt that verifies and whose
-/// subject is that exact `(ref, old, new)`. Deleting a protected ref is
-/// refused. `is_fast_forward` answers whether `old` is an ancestor of `new`.
+/// Every update of a protected ref needs a receipt that verifies, from a
+/// key granted the `land-receipt` kind, whose subject is that exact
+/// `(repository, ref, old, new)`. Deleting a protected ref is refused.
+/// `is_fast_forward` answers whether `old` is an ancestor of `new`.
 pub fn check(
+    repo_id: &str,
     updates: &[RefUpdate],
     push_options: &[String],
     trusted: &TrustedKeys,
@@ -60,10 +62,9 @@ pub fn check(
         if !update.old.is_zero() && !is_fast_forward(&update.old, &update.new) {
             return Err(format!("{} would not fast-forward from {} to {}", update.name, update.old, update.new));
         }
-        let subject = custody::ref_update_subject(&update.name, &update.old, &update.new);
-        let verified = receipts
-            .iter()
-            .any(|r| r.header.kind == "land-receipt" && r.header.subject == subject && r.verify(trusted).is_ok());
+        let subject = custody::ref_update_subject(repo_id, &update.name, &update.old, &update.new);
+        let verified =
+            receipts.iter().any(|r| r.header.kind == "land-receipt" && r.header.subject == subject && r.verify(trusted).is_ok());
         if !verified {
             return Err(format!(
                 "{}: no verified land receipt for {} -> {} (push through landd)",
@@ -77,11 +78,12 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use landd_core::custody::SigningKey;
+    use landd_core::custody::{Grant, SigningKey};
     use landd_core::digest::hex_encode;
     use serde_json::json;
 
     const MAIN: &str = "refs/heads/main";
+    const REPO: &str = "ssh://forge/project";
 
     fn oid(n: u8) -> Oid {
         Oid::from_slice(&[n; 20]).unwrap()
@@ -92,14 +94,14 @@ mod tests {
     }
 
     fn option(key: &SigningKey, kind: &str, name: &str, old: u8, new: u8) -> String {
-        let subject = custody::ref_update_subject(name, &oid(old), &oid(new));
+        let subject = custody::ref_update_subject(REPO, name, &oid(old), &oid(new));
         let receipt = CustodyEnvelopeV2::seal(key, "seat", "seat", kind, subject, json!({"batch_size": 1})).unwrap();
         format!("{}={}", custody::PUSH_OPTION, hex_encode(&receipt.to_wire().unwrap()))
     }
 
     fn trusted(key: &SigningKey) -> TrustedKeys {
         let mut keys = TrustedKeys::new();
-        keys.insert("seat", key.trusted());
+        keys.insert("seat", key.trusted(), Grant::new(&["seat"], &["land-receipt", "runner-attestation"])).unwrap();
         keys
     }
 
@@ -117,9 +119,9 @@ mod tests {
         let key = SigningKey::ed25519_from_seed([3; 32]);
         let protect = vec![MAIN.to_owned()];
         let options = vec!["unrelated=1".to_owned(), option(&key, "land-receipt", MAIN, 1, 2)];
-        check(&[update(1, 2, MAIN)], &options, &trusted(&key), &protect, |_, _| true).unwrap();
+        check(REPO, &[update(1, 2, MAIN)], &options, &trusted(&key), &protect, |_, _| true).unwrap();
         // Unprotected refs need nothing.
-        check(&[update(1, 2, "refs/heads/lane/x")], &[], &trusted(&key), &protect, |_, _| false).unwrap();
+        check(REPO, &[update(1, 2, "refs/heads/lane/x")], &[], &trusted(&key), &protect, |_, _| false).unwrap();
     }
 
     #[test]
@@ -129,7 +131,7 @@ mod tests {
         let protect = vec![MAIN.to_owned()];
         let keys = trusted(&key);
         let refused = |updates: &[RefUpdate], options: &[String], ff: bool| {
-            check(updates, options, &keys, &protect, |_, _| ff).is_err()
+            check(REPO, updates, options, &keys, &protect, |_, _| ff).is_err()
         };
         let good = option(&key, "land-receipt", MAIN, 1, 2);
 
@@ -145,6 +147,20 @@ mod tests {
         // One good receipt does not cover a second protected update in the same push.
         let both = vec![MAIN.to_owned(), "refs/heads/release".to_owned()];
         let updates = [update(1, 2, MAIN), update(1, 2, "refs/heads/release")];
-        assert!(check(&updates, &[good], &keys, &both, |_, _| true).is_err());
+        assert!(check(REPO, &updates, std::slice::from_ref(&good), &keys, &both, |_, _| true).is_err());
+        // The same receipt presented to a mirror of the repository.
+        assert!(check(
+            "ssh://forge/project-mirror",
+            &[update(1, 2, MAIN)],
+            std::slice::from_ref(&good),
+            &keys,
+            &protect,
+            |_, _| true
+        )
+        .is_err());
+        // A key granted only the runner role cannot admit a ref update.
+        let mut runner_only = TrustedKeys::new();
+        runner_only.insert("seat", key.trusted(), Grant::new(&["seat"], &["runner-attestation"])).unwrap();
+        assert!(check(REPO, &[update(1, 2, MAIN)], &[good], &runner_only, &protect, |_, _| true).is_err());
     }
 }

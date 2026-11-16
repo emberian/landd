@@ -4,6 +4,11 @@
 //! whitespace, strings use the shortest escape, and numbers are integers.
 //! Floats are refused: their text form is not unique, so they cannot sit
 //! under a digest or a signature.
+//!
+//! This is landd's own canonical form, not RFC 8785 (JCS): JCS sorts keys by
+//! UTF-16 code units and serializes floats. Nothing outside landd is
+//! expected to produce these bytes. `-0`, `1.0`, `1e2` and duplicate keys
+//! are all refused by [`CanonicalJson::from_untrusted`].
 
 use crate::digest::Digest32;
 use serde::de::DeserializeOwned;

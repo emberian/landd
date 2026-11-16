@@ -12,5 +12,5 @@ pub mod git;
 pub mod reasons;
 
 pub use canon::{canonical_json, CanonError, CanonicalJson};
-pub use config::{ConeSourceKind, ConfigError, CustodyMode, LandConfig};
+pub use config::{ConeSourceKind, ConfigError, CustodyMode, Isolation, LandConfig, UnitView};
 pub use digest::{Digest32, Oid};

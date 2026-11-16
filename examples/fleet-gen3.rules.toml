@@ -3,13 +3,24 @@
 # owns the Python walker each rule replaces.
 #
 #   landd sweep --repo <fleet> --rules examples/fleet-gen3.rules.toml \
-#               --gateaudits <fleet>/gateaudits.json
+#               --gateaudits <path to a trusted copy of gateaudits.json>
+#
+# Guards, domains and dynamic-loader declarations come from gateaudits.json;
+# this file declares no loader of its own.
 
 [imports]
 roots = [""]
 tests = ["tests/**/test_*.py", "bench/**/test_*.py"]
 implicit_conftest = true
-taint = "whole-tree"
+# strict: a read the analysis cannot bound widens the cone to the whole tree.
+# hermetic: the runner shows a unit only its cone's files, so such a read
+# finds no file instead; needs unit_view = "cone" in landd.toml.
+cone_model = "strict"
+# A loader declaration counts only while the loader's source shows a literal
+# prefix the declaration covers. "trust" also believes the ones it cannot check.
+unverified_loaders = "taint"
+# Census helpers that read every tracked file.
+whole_tree_calls = ["*settings_readers.census", "*test_land_one_writer.closure"]
 
 [[rule]]
 id = "no-tracked-bytecode"

@@ -123,18 +123,36 @@ impl Rule {
     }
 }
 
+/// What a cone does about a read it cannot bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum TaintPolicy {
-    /// A cone that reaches a dynamic load depends on the whole tree.
+pub enum ConeModel {
+    /// Static analysis alone must justify the cone. A read through a path
+    /// the analysis cannot follow (a parameter, an attribute, a computed
+    /// name), a child process, and an undeclared dynamic load each widen
+    /// the cone to the whole tree.
     #[default]
-    WholeTree,
-    /// A cone that reaches a dynamic load depends on every file under the
-    /// loader's own directory (the plugin-package pattern). A heuristic: it
-    /// is wrong for a loader that reads paths outside its package.
-    Package,
-    /// Record the taint bit and keep the static cone.
-    FlagOnly,
+    Strict,
+    /// The cone is enforced, not only inferred: the runner shows a unit
+    /// nothing but its cone's files, so a read the analysis missed finds no
+    /// file instead of silently depending on one. Opaque reads, child
+    /// processes and dynamic imports therefore do not widen; a path with a
+    /// known directory and an unknown tail reads that directory's subtree.
+    /// Scans the analysis cannot bound still widen, because a scan of
+    /// missing files passes vacuously. Only sound with `unit_view = "cone"`.
+    Hermetic,
+}
+
+/// What a loader declaration is worth when the loader's source does not
+/// show where its loads go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnverifiedLoaders {
+    /// Nothing: the loader widens every cone that reaches it.
+    #[default]
+    Taint,
+    /// The operator's word.
+    Trust,
 }
 
 fn default_roots() -> Vec<String> {
@@ -143,6 +161,10 @@ fn default_roots() -> Vec<String> {
 
 fn default_tests() -> Vec<String> {
     vec!["**/test_*.py".to_owned()]
+}
+
+fn default_always() -> Vec<String> {
+    ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"].map(String::from).to_vec()
 }
 
 fn default_true() -> bool {
@@ -161,16 +183,30 @@ pub struct ImportConfig {
     /// A test also depends on every `conftest.py` above it.
     #[serde(default = "default_true")]
     pub implicit_conftest: bool,
-    /// Extra inputs a unit reads without importing them: unit -> path patterns.
+    /// Files every unit depends on (test-runner configuration).
+    #[serde(default = "default_always")]
+    pub always: Vec<String>,
+    /// Extra inputs a unit reads without importing them: unit name pattern
+    /// -> path patterns (both fnmatch: `*` crosses `.` and `/`).
     #[serde(default)]
     pub guards: BTreeMap<String, Vec<String>>,
-    /// Audited dynamic loaders: file -> the path patterns its dynamic loads
-    /// can reach. A declared loader does not taint; its reads join the cone
-    /// of everything that imports it.
+    /// Declared dynamic loaders: file -> the path patterns its dynamic loads
+    /// can reach. A declaration counts only while the loader's own source
+    /// agrees with it (see `unverified_loaders`); it is checked again on
+    /// every tree, so an edit to the loader cannot hide behind it.
     #[serde(default)]
     pub loaders: BTreeMap<String, Vec<String>>,
+    /// As `loaders`, keyed and valued by module (`a.b`, `a.b.*`), the form
+    /// `gateaudits.json` uses.
     #[serde(default)]
-    pub taint: TaintPolicy,
+    pub loader_modules: BTreeMap<String, Vec<String>>,
+    /// Calls that read the whole tree (dotted-name patterns).
+    #[serde(default)]
+    pub whole_tree_calls: Vec<String>,
+    #[serde(default)]
+    pub cone_model: ConeModel,
+    #[serde(default)]
+    pub unverified_loaders: UnverifiedLoaders,
 }
 
 impl Default for ImportConfig {
@@ -179,9 +215,13 @@ impl Default for ImportConfig {
             roots: default_roots(),
             tests: default_tests(),
             implicit_conftest: true,
+            always: default_always(),
             guards: BTreeMap::new(),
             loaders: BTreeMap::new(),
-            taint: TaintPolicy::default(),
+            loader_modules: BTreeMap::new(),
+            whole_tree_calls: Vec::new(),
+            cone_model: ConeModel::default(),
+            unverified_loaders: UnverifiedLoaders::default(),
         }
     }
 }
@@ -207,16 +247,37 @@ pub enum RuleError {
     Invalid { id: String, problem: String },
 }
 
+/// The parts of a `gateaudits.json` that describe what units read. Its
+/// other tables (`carries`, `unrun`, `ledgers`, `absent`) are selection and
+/// merge hints for another tool and are not consumed: in particular `unrun`
+/// ("no test reads this file") is not used to shrink whole-tree cones,
+/// because a unit that reads every tracked file does read those files.
 #[derive(Deserialize)]
 struct GateAudits {
     #[serde(default)]
     guards: BTreeMap<String, GateGuard>,
+    #[serde(default)]
+    domains: BTreeMap<String, GateDomain>,
+    #[serde(default)]
+    dynamic: BTreeMap<String, GateLoader>,
 }
 
 #[derive(Deserialize)]
 struct GateGuard {
     #[serde(default)]
     reads: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GateDomain {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GateLoader {
+    #[serde(default)]
+    loads: Vec<String>,
 }
 
 impl RulePack {
@@ -250,14 +311,34 @@ impl RulePack {
         }
     }
 
-    /// Adopt the `guards` table of a `gateaudits.json`: each guarded test
-    /// module's `reads` become extra cone inputs for that unit.
+    /// Adopt a `gateaudits.json`: `guards` (unit -> reads) and `domains`
+    /// (unit pattern -> paths) become extra cone inputs of the units they
+    /// name, and `dynamic` (module -> loads) becomes loader declarations.
     pub fn with_gateaudits(mut self, text: &str) -> Result<Self, RuleError> {
         let audits: GateAudits = serde_json::from_str(text)?;
         for (unit, guard) in audits.guards {
             self.imports.guards.entry(unit).or_default().extend(guard.reads);
         }
+        for (units, domain) in audits.domains {
+            self.imports.guards.entry(units).or_default().extend(domain.paths);
+        }
+        for (module, loader) in audits.dynamic {
+            self.imports.loader_modules.entry(module).or_default().extend(loader.loads);
+        }
         Ok(self)
+    }
+
+    /// Identifies this pack. It is part of every cone's context, so a
+    /// verdict made under one pack is never read under another.
+    pub fn digest(&self) -> landd_core::Digest32 {
+        let canonical = landd_core::canonical_json(self).expect("a rule pack has no floats");
+        landd_core::Digest32::tagged("ast-sweep rule pack v1", &[&canonical, crate::facts::facts_version().as_bytes()])
+    }
+
+    /// Whether some rule needs the import graph (cones, or forbidden
+    /// imports, which resolve relative imports through it).
+    pub fn needs_graph(&self) -> bool {
+        self.exports_cones() || self.rule.iter().any(|r| !r.imports.is_empty() || !r.symbols.is_empty())
     }
 
     pub fn exports_cones(&self) -> bool {
@@ -282,9 +363,7 @@ impl RulePack {
                 {
                     return Err(invalid("needs symbols, imports or facts"))
                 }
-                RuleKind::SingleOwnerPattern if rule.owners.len() != 1 => {
-                    return Err(invalid("needs exactly one owner path"))
-                }
+                RuleKind::SingleOwnerPattern if rule.owners.len() != 1 => return Err(invalid("needs exactly one owner path")),
                 _ => {}
             }
         }
@@ -337,7 +416,8 @@ why = "stopfacts has one reader"
         assert!(matches!(bad("[[rule]]\nid = \"x\"\nkind = \"atomic_replace_owner\"\n"), RuleError::Invalid { .. }));
         assert!(matches!(bad("[[rule]]\nid = \"x\"\nkind = \"forbidden_symbol_or_call\"\n"), RuleError::Invalid { .. }));
         assert!(matches!(bad("[[rule]]\nid = \"x\"\nkind = \"uncatalogued_settings_keys\"\n"), RuleError::Invalid { .. }));
-        let twice = "[[rule]]\nid = \"x\"\nkind = \"no_tracked_bytecode\"\n[[rule]]\nid = \"x\"\nkind = \"no_tracked_bytecode\"\n";
+        let twice =
+            "[[rule]]\nid = \"x\"\nkind = \"no_tracked_bytecode\"\n[[rule]]\nid = \"x\"\nkind = \"no_tracked_bytecode\"\n";
         assert!(matches!(bad(twice), RuleError::Invalid { .. }));
     }
 
@@ -345,10 +425,19 @@ why = "stopfacts has one reader"
     fn gateaudits_guards_become_cone_reads() {
         let audits = r#"{"schema": 2, "carries": ["test_one_owner"], "guards": {
             "tests.door.test_help_artifact": {"reads": ["*"], "why": "copies the whole repo"},
-            "tests.door.test_service_state_base": {"reads": ["fabd/*", "land/*", "unchanged.py"], "why": "copies fabd"}}}"#;
+            "tests.door.test_service_state_base": {"reads": ["fabd/*", "land/*", "unchanged.py"], "why": "copies fabd"}},
+            "domains": {"tests.fleetd.test_task*": {"naming": ["TaskDefaults"], "paths": ["fleetd/taskdefaults.json"], "why": "reads the catalog as data"}},
+            "dynamic": {"land.checks": {"loads": ["land.checks.*"], "why": "by name"}, "fleetd.hooks.capability": {"loads": [], "why": "find_spec"}},
+            "unrun": {"LICENSE": "no source reads it"}, "ledgers": {}, "absent": {}}"#;
         let pack = RulePack::builtin().with_gateaudits(audits).unwrap();
         assert_eq!(pack.imports.guards["tests.door.test_help_artifact"], vec!["*"]);
         assert_eq!(pack.imports.guards["tests.door.test_service_state_base"].len(), 3);
+        assert_eq!(pack.imports.guards["tests.fleetd.test_task*"], vec!["fleetd/taskdefaults.json"]);
+        assert_eq!(pack.imports.loader_modules["land.checks"], vec!["land.checks.*"]);
+        assert!(pack.imports.loader_modules["fleetd.hooks.capability"].is_empty());
         assert!(pack.exports_cones());
+        // The pack's identity moves with every declaration.
+        assert_ne!(pack.digest(), RulePack::builtin().digest());
+        assert_eq!(pack.digest(), RulePack::builtin().with_gateaudits(audits).unwrap().digest());
     }
 }

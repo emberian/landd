@@ -73,16 +73,23 @@ pub enum CustodyError {
     Malformed,
     #[error("signature does not verify")]
     BadSignature,
+    #[error("key {key_id:?} is not trusted to seal {kind:?} as seat {seat:?}")]
+    NotAuthorized { key_id: String, seat: String, kind: String },
     #[error("key material is invalid: {0}")]
     BadKey(String),
     #[error("reading {path}: {detail}")]
     KeyFile { path: String, detail: String },
 }
 
-/// The subject of a land receipt: one ref moving from `old` to `new`.
-pub fn ref_update_subject(target_ref: &str, old: &crate::digest::Oid, new: &crate::digest::Oid) -> Digest32 {
-    Digest32::tagged("landd ref update v1", &[target_ref.as_bytes(), old.as_bytes(), new.as_bytes()])
+/// The subject of a land receipt: one ref of one repository moving from
+/// `old` to `new`. The repository id is part of it, so a receipt for one
+/// repository says nothing about a fork or mirror that trusts the same keys.
+pub fn ref_update_subject(repo_id: &str, target_ref: &str, old: &crate::digest::Oid, new: &crate::digest::Oid) -> Digest32 {
+    Digest32::tagged("landd ref update v2", &[repo_id.as_bytes(), target_ref.as_bytes(), old.as_bytes(), new.as_bytes()])
 }
+
+/// Git's limit on one push option (a pkt-line payload).
+pub const MAX_PUSH_OPTION_BYTES: usize = 65_000;
 
 /// The push option that carries a receipt to the forge's `pre-receive` hook.
 pub const PUSH_OPTION: &str = "landd-custody";
@@ -107,11 +114,46 @@ fn signing_message_with_domain(
     Ok(message)
 }
 
-/// Secret key material. Lives only in the supervisor process.
+/// Secret bytes that are overwritten when dropped.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(Vec<u8>);
+
+impl Secret {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            // SAFETY: a volatile write to a byte this value owns; it keeps
+            // the compiler from eliding the wipe of memory about to be freed.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
+/// Secret key material. Lives only in the supervisor process. Ed25519 keys
+/// are zeroized on drop by `ed25519-dalek`; HMAC secrets by [`Secret`].
 pub enum SigningKey {
     Ed25519(EdSigningKey),
     SshsigEd25519(EdSigningKey),
-    HmacSha256(Vec<u8>),
+    HmacSha256(Secret),
+}
+
+impl Clone for SigningKey {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ed25519(key) => Self::Ed25519(EdSigningKey::from_bytes(&key.to_bytes())),
+            Self::SshsigEd25519(key) => Self::SshsigEd25519(EdSigningKey::from_bytes(&key.to_bytes())),
+            Self::HmacSha256(secret) => Self::HmacSha256(secret.clone()),
+        }
+    }
 }
 
 impl std::fmt::Debug for SigningKey {
@@ -124,7 +166,7 @@ impl std::fmt::Debug for SigningKey {
 pub enum TrustedKey {
     Ed25519(EdVerifyingKey),
     SshsigEd25519(EdVerifyingKey),
-    HmacSha256(Vec<u8>),
+    HmacSha256(Secret),
 }
 
 impl TrustedKey {
@@ -137,25 +179,55 @@ impl TrustedKey {
     }
 }
 
+/// What a trusted key may attest: the seats it may sign as and the kinds of
+/// envelope it may seal. Both lists are exact; there is no wildcard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grant {
+    pub seats: Vec<String>,
+    pub kinds: Vec<String>,
+}
+
+impl Grant {
+    pub fn new(seats: &[&str], kinds: &[&str]) -> Self {
+        Self { seats: seats.iter().map(|s| s.to_string()).collect(), kinds: kinds.iter().map(|s| s.to_string()).collect() }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KeyFileEntry {
+struct SigningKeyFile {
     key_id: String,
     alg: SigAlg,
-    /// Hex: the 32-byte Ed25519 seed or public key, or the HMAC secret.
+    /// Hex: the 32-byte Ed25519 seed, or the HMAC secret.
     key: String,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TrustedEntry {
+    key_id: String,
+    alg: SigAlg,
+    /// Hex: the 32-byte Ed25519 public key, or the shared HMAC secret.
+    key: String,
+    seats: Vec<String>,
+    kinds: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustedFile {
-    keys: Vec<KeyFileEntry>,
+    keys: Vec<TrustedEntry>,
 }
 
 fn ed_bytes(hex: &str) -> Result<[u8; 32], CustodyError> {
     hex_decode(hex)
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
         .ok_or_else(|| CustodyError::BadKey("expected 32 bytes of lowercase hex".into()))
+}
+
+fn key_file(path: &Path) -> impl Fn(std::io::Error) -> CustodyError + '_ {
+    move |e| CustodyError::KeyFile { path: path.display().to_string(), detail: e.to_string() }
 }
 
 impl SigningKey {
@@ -175,6 +247,10 @@ impl SigningKey {
         Self::SshsigEd25519(EdSigningKey::from_bytes(&seed))
     }
 
+    pub fn hmac(secret: Vec<u8>) -> Self {
+        Self::HmacSha256(Secret::new(secret))
+    }
+
     /// What a verifier needs in order to trust this key.
     pub fn trusted(&self) -> TrustedKey {
         match self {
@@ -186,7 +262,7 @@ impl SigningKey {
 
     /// Parse a key file: `{"key_id": …, "alg": …, "key": "<hex>"}`.
     pub fn from_json(text: &str) -> Result<(String, Self), CustodyError> {
-        let entry: KeyFileEntry = serde_json::from_str(text).map_err(|e| CustodyError::BadKey(e.to_string()))?;
+        let entry: SigningKeyFile = serde_json::from_str(text).map_err(|e| CustodyError::BadKey(e.to_string()))?;
         let key = match entry.alg {
             SigAlg::Ed25519 => Self::ed25519_from_seed(ed_bytes(&entry.key)?),
             SigAlg::SshsigEd25519 => Self::sshsig_from_seed(ed_bytes(&entry.key)?),
@@ -195,9 +271,18 @@ impl SigningKey {
         Ok((entry.key_id, key))
     }
 
+    /// Load a signing key. The file must be a regular file that only its
+    /// owner can read: a key other accounts can read attests nothing.
     pub fn load(path: &Path) -> Result<(String, Self), CustodyError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| CustodyError::KeyFile { path: path.display().to_string(), detail: e.to_string() })?;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(path).map_err(key_file(path))?;
+        if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+            return Err(CustodyError::KeyFile {
+                path: path.display().to_string(),
+                detail: "a signing key must be a regular file with mode 0600 or stricter".into(),
+            });
+        }
+        let text = std::fs::read_to_string(path).map_err(key_file(path))?;
         Self::from_json(&text)
     }
 
@@ -206,7 +291,7 @@ impl SigningKey {
             Self::Ed25519(key) => key.sign(message).to_bytes().to_vec(),
             Self::SshsigEd25519(key) => sshsig_sign(key, message),
             Self::HmacSha256(secret) => {
-                let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac takes any key length");
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.bytes()).expect("hmac takes any key length");
                 mac.update(message);
                 mac.finalize().into_bytes().to_vec()
             }
@@ -214,24 +299,36 @@ impl SigningKey {
     }
 }
 
-fn hmac_secret(hex: &str) -> Result<Vec<u8>, CustodyError> {
+fn hmac_secret(hex: &str) -> Result<Secret, CustodyError> {
     match hex_decode(hex) {
-        Some(secret) if secret.len() >= 16 => Ok(secret),
+        Some(secret) if secret.len() >= 16 => Ok(Secret::new(secret)),
         _ => Err(CustodyError::BadKey("hmac secret must be at least 16 bytes of lowercase hex".into())),
     }
 }
 
-/// The keys a verifier accepts, by `key_id`.
+/// The keys a verifier accepts, by `key_id`, each with what it may attest.
 #[derive(Clone, Default)]
-pub struct TrustedKeys(BTreeMap<String, TrustedKey>);
+pub struct TrustedKeys(BTreeMap<String, (TrustedKey, Grant)>);
 
 impl TrustedKeys {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(&mut self, key_id: impl Into<String>, key: TrustedKey) {
-        self.0.insert(key_id.into(), key);
+    /// Trust `key` under `key_id` for `grant`. A second key under the same
+    /// id, and a weak Ed25519 key, are errors.
+    pub fn insert(&mut self, key_id: impl Into<String>, key: TrustedKey, grant: Grant) -> Result<(), CustodyError> {
+        let key_id = key_id.into();
+        if let TrustedKey::Ed25519(public) | TrustedKey::SshsigEd25519(public) = &key {
+            if public.is_weak() {
+                return Err(CustodyError::BadKey(format!("key {key_id:?} is a weak (small-order) Ed25519 key")));
+            }
+        }
+        if self.0.contains_key(&key_id) {
+            return Err(CustodyError::BadKey(format!("key id {key_id:?} appears twice")));
+        }
+        self.0.insert(key_id, (key, grant));
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -242,45 +339,48 @@ impl TrustedKeys {
         self.0.is_empty()
     }
 
-    /// Parse `{"keys": [{"key_id": …, "alg": …, "key": "<hex>"}, …]}`.
+    /// Parse `{"keys": [{"key_id", "alg", "key": "<hex>", "seats": […], "kinds": […]}, …]}`.
     pub fn from_json(text: &str) -> Result<Self, CustodyError> {
         let file: TrustedFile = serde_json::from_str(text).map_err(|e| CustodyError::BadKey(e.to_string()))?;
         let mut keys = Self::new();
         for entry in file.keys {
-            let verifying = |hex: &str| {
-                EdVerifyingKey::from_bytes(&ed_bytes(hex)?).map_err(|e| CustodyError::BadKey(e.to_string()))
-            };
+            let verifying =
+                |hex: &str| EdVerifyingKey::from_bytes(&ed_bytes(hex)?).map_err(|e| CustodyError::BadKey(e.to_string()));
             let key = match entry.alg {
                 SigAlg::Ed25519 => TrustedKey::Ed25519(verifying(&entry.key)?),
                 SigAlg::SshsigEd25519 => TrustedKey::SshsigEd25519(verifying(&entry.key)?),
                 SigAlg::HmacSha256 => TrustedKey::HmacSha256(hmac_secret(&entry.key)?),
             };
-            keys.insert(entry.key_id, key);
+            keys.insert(entry.key_id, key, Grant { seats: entry.seats, kinds: entry.kinds })?;
         }
         Ok(keys)
     }
 
     pub fn load(path: &Path) -> Result<Self, CustodyError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| CustodyError::KeyFile { path: path.display().to_string(), detail: e.to_string() })?;
+        let text = std::fs::read_to_string(path).map_err(key_file(path))?;
         Self::from_json(&text)
     }
 
-    /// The trusted-keys file text for these keys.
-    pub fn to_json(&self) -> String {
-        let keys = self
-            .0
-            .iter()
-            .map(|(key_id, key)| KeyFileEntry {
+    /// The trusted-keys file text for these keys. Shared HMAC secrets are
+    /// not public material and are never written out by this function.
+    pub fn public_json(&self) -> Result<String, CustodyError> {
+        let mut keys = Vec::with_capacity(self.0.len());
+        for (key_id, (key, grant)) in &self.0 {
+            let public = match key {
+                TrustedKey::Ed25519(k) | TrustedKey::SshsigEd25519(k) => hex_encode(k.as_bytes()),
+                TrustedKey::HmacSha256(_) => {
+                    return Err(CustodyError::BadKey(format!("key {key_id:?} is a shared secret and has no public form")))
+                }
+            };
+            keys.push(TrustedEntry {
                 key_id: key_id.clone(),
                 alg: key.alg(),
-                key: match key {
-                    TrustedKey::Ed25519(k) | TrustedKey::SshsigEd25519(k) => hex_encode(k.as_bytes()),
-                    TrustedKey::HmacSha256(secret) => hex_encode(secret),
-                },
-            })
-            .collect();
-        serde_json::to_string_pretty(&TrustedFile { keys }).expect("key file serializes")
+                key: public,
+                seats: grant.seats.clone(),
+                kinds: grant.kinds.clone(),
+            });
+        }
+        Ok(serde_json::to_string_pretty(&TrustedFile { keys }).expect("key file serializes"))
     }
 }
 
@@ -311,7 +411,8 @@ impl CustodyEnvelopeV2 {
         if self.header.v != VERSION {
             return Err(CustodyError::Version(self.header.v));
         }
-        let key = trusted.0.get(&self.header.key_id).ok_or_else(|| CustodyError::UnknownKey(self.header.key_id.clone()))?;
+        let (key, grant) =
+            trusted.0.get(&self.header.key_id).ok_or_else(|| CustodyError::UnknownKey(self.header.key_id.clone()))?;
         if key.alg() != self.header.alg {
             return Err(CustodyError::AlgMismatch { key_id: self.header.key_id.clone(), alg: self.header.alg });
         }
@@ -321,11 +422,20 @@ impl CustodyEnvelopeV2 {
             TrustedKey::Ed25519(public) => ed_verify(public, &message, &signature),
             TrustedKey::SshsigEd25519(public) => sshsig_verify(public, &message, &signature),
             TrustedKey::HmacSha256(secret) => {
-                let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac takes any key length");
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.bytes()).expect("hmac takes any key length");
                 mac.update(&message);
                 mac.verify_slice(&signature).map_err(|_| CustodyError::BadSignature)
             }
+        }?;
+        // A valid signature by a key that was never given this role is not an attestation.
+        if !grant.seats.contains(&self.header.seat) || !grant.kinds.contains(&self.header.kind) {
+            return Err(CustodyError::NotAuthorized {
+                key_id: self.header.key_id.clone(),
+                seat: self.header.seat.clone(),
+                kind: self.header.kind.clone(),
+            });
         }
+        Ok(())
     }
 
     /// Read the claims a caller knows about; unknown claims are ignored here
@@ -338,8 +448,11 @@ impl CustodyEnvelopeV2 {
         Ok(canonical_json(self)?)
     }
 
+    /// Parse wire bytes. Only the canonical encoding is accepted, so two
+    /// parsers can never read different claims out of the same bytes
+    /// (duplicate keys, alternative escapes and whitespace are all refused).
     pub fn from_wire(bytes: &[u8]) -> Result<Self, CustodyError> {
-        serde_json::from_slice(bytes).map_err(|e| CustodyError::Canon(CanonError::Json(e)))
+        Ok(crate::canon::CanonicalJson::from_untrusted(bytes)?.parse()?)
     }
 
     /// The SSHSIG signature in the armored form `ssh-keygen -Y verify` reads.
@@ -361,9 +474,7 @@ impl CustodyEnvelopeV2 {
 
 fn ed_verify(public: &EdVerifyingKey, message: &[u8], signature: &[u8]) -> Result<(), CustodyError> {
     let bytes = <[u8; 64]>::try_from(signature).map_err(|_| CustodyError::Malformed)?;
-    public
-        .verify_strict(message, &ed25519_dalek::Signature::from_bytes(&bytes))
-        .map_err(|_| CustodyError::BadSignature)
+    public.verify_strict(message, &ed25519_dalek::Signature::from_bytes(&bytes)).map_err(|_| CustodyError::BadSignature)
 }
 
 fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -394,10 +505,9 @@ fn ssh_public_blob(public: &EdVerifyingKey) -> Vec<u8> {
 /// The `authorized_keys`-style line for an Ed25519 public key.
 pub fn ssh_public_line(key: &TrustedKey) -> Option<String> {
     match key {
-        TrustedKey::Ed25519(public) | TrustedKey::SshsigEd25519(public) => Some(format!(
-            "ssh-ed25519 {}",
-            base64::engine::general_purpose::STANDARD.encode(ssh_public_blob(public))
-        )),
+        TrustedKey::Ed25519(public) | TrustedKey::SshsigEd25519(public) => {
+            Some(format!("ssh-ed25519 {}", base64::engine::general_purpose::STANDARD.encode(ssh_public_blob(public))))
+        }
         TrustedKey::HmacSha256(_) => None,
     }
 }
@@ -468,16 +578,12 @@ mod tests {
     use serde_json::json;
 
     fn keys() -> Vec<SigningKey> {
-        vec![
-            SigningKey::ed25519_from_seed([7; 32]),
-            SigningKey::sshsig_from_seed([8; 32]),
-            SigningKey::HmacSha256(vec![9; 32]),
-        ]
+        vec![SigningKey::ed25519_from_seed([7; 32]), SigningKey::sshsig_from_seed([8; 32]), SigningKey::hmac(vec![9; 32])]
     }
 
     fn trust(key: &SigningKey) -> TrustedKeys {
         let mut trusted = TrustedKeys::new();
-        trusted.insert("seat-a", key.trusted());
+        trusted.insert("seat-a", key.trusted(), Grant::new(&["seat-a"], &["land-receipt"])).unwrap();
         trusted
     }
 
@@ -524,7 +630,7 @@ mod tests {
                 envelope.signature,
                 serde_json::to_string(&envelope.header).unwrap()
             );
-            let received = CustodyEnvelopeV2::from_wire(text.as_bytes()).unwrap();
+            let received: CustodyEnvelopeV2 = serde_json::from_str(&text).unwrap();
             assert_eq!(received.signature, original_signature);
             received.verify(&trust(&key)).unwrap();
             assert_eq!(received.claims_as::<Known>().unwrap().verdict, "green");
@@ -566,6 +672,10 @@ mod tests {
             let mut seat = envelope.clone();
             seat.header.seat = "seat-b".into();
             assert!(matches!(seat.verify(&trusted), Err(CustodyError::BadSignature)));
+
+            let mut key_id = envelope.clone();
+            key_id.header.key_id = "seat-z".into();
+            assert!(matches!(key_id.verify(&trusted), Err(CustodyError::UnknownKey(_))));
 
             let mut kind = envelope.clone();
             kind.header.kind = "runner-attestation".into();
@@ -645,9 +755,11 @@ mod tests {
         let secret = format!(r#"{{"key_id":"seat-a","alg":"ed25519","key":"{}"}}"#, hex_encode(&[7; 32]));
         let (key_id, key) = SigningKey::from_json(&secret).unwrap();
         assert_eq!(key_id, "seat-a");
-        let trusted = TrustedKeys::from_json(&trust(&key).to_json()).unwrap();
+        let trusted = TrustedKeys::from_json(&trust(&key).public_json().unwrap()).unwrap();
         assert_eq!(trusted.len(), 1);
         seal(&key, json!({"a": 1})).verify(&trusted).unwrap();
+        // A shared secret is not public material.
+        assert!(trust(&SigningKey::hmac(vec![9; 32])).public_json().is_err());
         assert!(SigningKey::from_json(r#"{"key_id":"x","alg":"hmac-sha256","key":"00"}"#).is_err());
         assert!(format!("{key:?}").contains("<secret>"));
     }
@@ -686,5 +798,83 @@ mod tests {
         tampered[20] ^= 1;
         assert!(!check(&tampered));
         assert!(ssh_public_line(&key.trusted()).unwrap().starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"));
+    }
+
+    /// Key roles: a key trusted as a runner cannot mint land receipts, and a
+    /// key trusted for one seat cannot sign as another, however valid its
+    /// signature is.
+    #[test]
+    fn tooth_a_valid_signature_outside_the_keys_grant_is_refused() {
+        for key in keys() {
+            let land = CustodyEnvelopeV2::seal(&key, "k", "seat-a", "land-receipt", Digest32::blake3(b"s"), json!({})).unwrap();
+            let mut runner_only = TrustedKeys::new();
+            runner_only.insert("k", key.trusted(), Grant::new(&["seat-a"], &["runner-attestation"])).unwrap();
+            assert!(matches!(land.verify(&runner_only), Err(CustodyError::NotAuthorized { .. })));
+            let mut other_seat = TrustedKeys::new();
+            other_seat.insert("k", key.trusted(), Grant::new(&["seat-b"], &["land-receipt"])).unwrap();
+            assert!(matches!(land.verify(&other_seat), Err(CustodyError::NotAuthorized { .. })));
+            let mut granted = TrustedKeys::new();
+            granted.insert("k", key.trusted(), Grant::new(&["seat-b", "seat-a"], &["land-receipt"])).unwrap();
+            land.verify(&granted).unwrap();
+            let mut nothing = TrustedKeys::new();
+            nothing.insert("k", key.trusted(), Grant::new(&[], &[])).unwrap();
+            assert!(matches!(land.verify(&nothing), Err(CustodyError::NotAuthorized { .. })));
+        }
+    }
+
+    #[test]
+    fn tooth_wire_bytes_must_be_canonical() {
+        let key = SigningKey::ed25519_from_seed([7; 32]);
+        let envelope = seal(&key, json!({"verdict": "green", "batch_size": 4}));
+        let wire = String::from_utf8(envelope.to_wire().unwrap()).unwrap();
+        assert_eq!(CustodyEnvelopeV2::from_wire(wire.as_bytes()).unwrap(), envelope);
+        // A duplicate claim key: last-wins parsers and first-wins parsers
+        // would disagree about what was signed.
+        let duplicated = wire.replacen("\"batch_size\":4", "\"batch_size\":9,\"batch_size\":4", 1);
+        assert_ne!(duplicated, wire);
+        assert!(CustodyEnvelopeV2::from_wire(duplicated.as_bytes()).is_err());
+        let spaced = wire.replacen(":", ": ", 1);
+        assert!(CustodyEnvelopeV2::from_wire(spaced.as_bytes()).is_err());
+        let escaped = wire.replacen("green", "gr\\u0065en", 1);
+        assert!(CustodyEnvelopeV2::from_wire(escaped.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn tooth_key_stores_refuse_duplicates_weak_keys_and_readable_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+        let key = SigningKey::ed25519_from_seed([7; 32]);
+        let mut trusted = trust(&key);
+        let again = trusted.insert("seat-a", SigningKey::ed25519_from_seed([8; 32]).trusted(), Grant::new(&["x"], &["y"]));
+        assert!(matches!(again, Err(CustodyError::BadKey(_))));
+        let twice = format!(
+            r#"{{"keys":[{{"key_id":"a","alg":"ed25519","key":"{0}","seats":["s"],"kinds":["k"]}},{{"key_id":"a","alg":"ed25519","key":"{0}","seats":["s"],"kinds":["k"]}}]}}"#,
+            hex_encode(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes())
+        );
+        assert!(TrustedKeys::from_json(&twice).is_err());
+        // The identity point: a small-order key under which forgeries verify.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = EdVerifyingKey::from_bytes(&identity).unwrap();
+        assert!(TrustedKeys::new().insert("weak", TrustedKey::Ed25519(weak), Grant::new(&["s"], &["k"])).is_err());
+        // Entries without a grant do not parse.
+        let ungranted = format!(r#"{{"keys":[{{"key_id":"a","alg":"ed25519","key":"{}"}}]}}"#, hex_encode(&[7; 32]));
+        assert!(TrustedKeys::from_json(&ungranted).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seat.key.json");
+        std::fs::write(&path, format!(r#"{{"key_id":"seat-a","alg":"ed25519","key":"{}"}}"#, hex_encode(&[7; 32]))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(SigningKey::load(&path), Err(CustodyError::KeyFile { .. })));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(SigningKey::load(&path).unwrap().0, "seat-a");
+    }
+
+    #[test]
+    fn receipt_subjects_name_the_repository() {
+        let (old, new) = (crate::digest::Oid::from_slice(&[1; 20]).unwrap(), crate::digest::Oid::from_slice(&[2; 20]).unwrap());
+        let here = ref_update_subject("ssh://forge/a", "refs/heads/main", &old, &new);
+        assert_ne!(here, ref_update_subject("ssh://forge/a-mirror", "refs/heads/main", &old, &new));
+        assert_ne!(here, ref_update_subject("ssh://forge/a", "refs/heads/next", &old, &new));
+        assert_ne!(here, ref_update_subject("ssh://forge/a", "refs/heads/main", &new, &old));
     }
 }

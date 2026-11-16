@@ -1,9 +1,9 @@
 //! `BlobFactsCache`: summaries keyed by content, kept forever.
 //!
 //! ```text
-//! <root>/blobs/v<N>/<kind>/ab/<blob oid>.bin   one blob's facts
-//! <root>/packs/v<N>/ab/<pack key>.bin          facts of one run of sibling files
-//! <root>/catalogs/v<N>/ab/<blob oid>.bin       the keys of one settings catalog
+//! <root>/blobs/<version>/<kind>/ab/<blob oid>.bin   one blob's facts
+//! <root>/packs/<version>/ab/<pack key>.bin          facts of one run of sibling files
+//! <root>/catalogs/<version>/ab/<blob oid>.bin       the keys of one settings catalog
 //! ```
 //!
 //! A git object id names its bytes, so an entry is never stale and nothing
@@ -14,10 +14,14 @@
 //! in memory (bounded), by pack and by blob, which is what a long-lived
 //! daemon sweeps from: after a change it parses the changed blobs and reads
 //! nothing else.
-//! Entries carry a checksum; a torn or foreign file is a miss and gets
-//! rewritten.
+//! `<version>` is derived from the extractor's own source
+//! ([`crate::facts::facts_version`]), so no entry outlives the code that
+//! wrote it. Entries carry a checksum against torn writes; a torn or foreign
+//! file is a miss and gets rewritten. The checksum is not a defence against
+//! someone who can write the directory (they could write a valid entry):
+//! that defence is the directory itself, which must be private to the user.
 
-use crate::facts::{FileFacts, FileKind, FACTS_VERSION};
+use crate::facts::{facts_version, FileFacts, FileKind};
 use landd_core::{fsx, Digest32, Oid};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
@@ -47,8 +51,14 @@ pub struct BlobFactsCache {
 }
 
 impl BlobFactsCache {
-    pub fn open(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), memory: Arc::default(), blobs: Arc::default(), catalogs: Arc::default() }
+    /// Open (creating it private to this user) the cache at `root`. A
+    /// directory that another user owns, or that group or others can write,
+    /// is refused: whoever can write the cache decides what every later
+    /// sweep believes about a blob.
+    pub fn open(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let root = root.into();
+        fsx::private_dir(&root)?;
+        Ok(Self { root, memory: Arc::default(), blobs: Arc::default(), catalogs: Arc::default() })
     }
 
     fn remember(&self, key: &Digest32, members: &[(Oid, FileKind)], pack: &Pack) {
@@ -73,7 +83,7 @@ impl BlobFactsCache {
     }
 
     pub fn blob_path(&self, kind: FileKind, oid: &Oid) -> PathBuf {
-        let dir = self.root.join("blobs").join(format!("v{FACTS_VERSION}")).join(kind.slug());
+        let dir = self.root.join("blobs").join(facts_version()).join(kind.slug());
         fsx::shard1(&dir, &oid.to_hex(), ".bin")
     }
 
@@ -90,7 +100,7 @@ impl BlobFactsCache {
     }
 
     pub fn pack_path(&self, key: &Digest32) -> PathBuf {
-        let dir = self.root.join("packs").join(format!("v{FACTS_VERSION}"));
+        let dir = self.root.join("packs").join(facts_version());
         fsx::shard1(&dir, &key.to_hex(), ".bin")
     }
 
@@ -108,7 +118,7 @@ impl BlobFactsCache {
     }
 
     fn catalog_path(&self, oid: &Oid) -> PathBuf {
-        let dir = self.root.join("catalogs").join(format!("v{FACTS_VERSION}"));
+        let dir = self.root.join("catalogs").join(facts_version());
         fsx::shard1(&dir, &oid.to_hex(), ".bin")
     }
 
@@ -161,7 +171,15 @@ fn read_entry<T: DeserializeOwned>(path: &Path) -> Option<T> {
     if blake3::hash(body).as_bytes() != checksum {
         return None;
     }
-    bincode::deserialize(body).ok()
+    // Bounded by the entry's own size: a forged length prefix cannot make
+    // the decoder allocate more than the file holds.
+    use bincode::Options as _;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(body.len() as u64)
+        .deserialize(body)
+        .ok()
 }
 
 fn write_entry<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
@@ -186,7 +204,7 @@ mod tests {
     #[test]
     fn blob_entries_round_trip_at_sharded_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = BlobFactsCache::open(dir.path());
+        let cache = BlobFactsCache::open(dir.path().join("c")).unwrap();
         let (oid, facts) = sample();
         assert_eq!(cache.get_blob(FileKind::Python, &oid), None);
         cache.put_blob(FileKind::Python, &oid, &facts).unwrap();
@@ -194,7 +212,8 @@ mod tests {
         // The same bytes read as another kind are another entry.
         assert_eq!(cache.get_blob(FileKind::Recipe, &oid), None);
         let hex = oid.to_hex();
-        let expected = dir.path().join("blobs/v1/py").join(&hex[..2]).join(format!("{hex}.bin"));
+        let expected =
+            dir.path().join("c").join("blobs").join(facts_version()).join("py").join(&hex[..2]).join(format!("{hex}.bin"));
         assert_eq!(cache.blob_path(FileKind::Python, &oid), expected);
         assert!(expected.is_file());
 
@@ -204,14 +223,14 @@ mod tests {
             BlobFactsCache::pack_key(members.into_iter()),
             BlobFactsCache::pack_key([(oid, FileKind::Recipe)].into_iter())
         );
-        let packed = BlobFactsCache::open(dir.path().join("packs-only"));
+        let packed = BlobFactsCache::open(dir.path().join("packs-only")).unwrap();
         assert!(packed.get_pack(&members).is_none());
         packed.put_pack(&members, &pack).unwrap();
         // This handle answers from memory, by pack and by blob; a fresh
         // handle reads the pack file once and then does the same.
         assert_eq!(packed.get_pack(&members), Some((pack.clone(), true)));
         assert_eq!(packed.get_blob(FileKind::Python, &oid), Some((Arc::new(facts), true)));
-        let reopened = BlobFactsCache::open(dir.path().join("packs-only"));
+        let reopened = BlobFactsCache::open(dir.path().join("packs-only")).unwrap();
         assert_eq!(reopened.get_blob(FileKind::Python, &oid), None);
         assert_eq!(reopened.get_pack(&members), Some((pack.clone(), false)));
         assert_eq!(reopened.get_pack(&members), Some((pack, true)));
@@ -221,13 +240,13 @@ mod tests {
         assert_eq!(cache.get_catalog(&oid), None);
         cache.put_catalog(&oid, &keys).unwrap();
         assert_eq!(cache.get_catalog(&oid), Some(keys.clone()));
-        assert_eq!(BlobFactsCache::open(dir.path()).get_catalog(&oid), Some(keys));
+        assert_eq!(BlobFactsCache::open(dir.path().join("c")).unwrap().get_catalog(&oid), Some(keys));
     }
 
     #[test]
     fn tooth_entries_have_no_expiry() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = BlobFactsCache::open(dir.path());
+        let cache = BlobFactsCache::open(dir.path().join("c")).unwrap();
         let (oid, facts) = sample();
         cache.put_blob(FileKind::Python, &oid, &facts).unwrap();
         let path = cache.blob_path(FileKind::Python, &oid);
@@ -241,7 +260,7 @@ mod tests {
     #[test]
     fn tooth_torn_or_tampered_entries_are_misses() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = BlobFactsCache::open(dir.path());
+        let cache = BlobFactsCache::open(dir.path().join("c")).unwrap();
         let (oid, facts) = sample();
         cache.put_blob(FileKind::Python, &oid, &facts).unwrap();
         let path = cache.blob_path(FileKind::Python, &oid);

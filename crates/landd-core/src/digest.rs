@@ -27,9 +27,7 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         _ => None,
     };
-    raw.chunks_exact(2)
-        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
-        .collect()
+    raw.chunks_exact(2).map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?)).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -139,9 +137,7 @@ impl Oid {
     }
 
     pub fn from_hex(s: &str) -> Result<Self, ParseIdError> {
-        hex_decode(s)
-            .and_then(|v| Self::from_slice(&v))
-            .ok_or_else(|| ParseIdError { what: "git oid", input: s.to_owned() })
+        hex_decode(s).and_then(|v| Self::from_slice(&v)).ok_or_else(|| ParseIdError { what: "git oid", input: s.to_owned() })
     }
 
     pub fn as_bytes(&self) -> &[u8] {

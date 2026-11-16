@@ -6,13 +6,19 @@ A speculative Git merge train and content-addressed tree checker, written in Rus
 
 ## Development status
 
-This is an experimental implementation undergoing hardening. The initial suite passes, but audits identified gaps in runner isolation, dependency tracking, delivery recovery, and daemon handling. Do not use the current train to enforce an adversarial admission boundary.
+This is an experimental implementation. Two audits of its first version found gaps in runner isolation, dependency tracking, delivery recovery and daemon handling; [HARDENING.md](HARDENING.md) lists every finding with what was done and the tests that show it. Read that file before relying on anything here.
 
-The initial Fleet corpus benchmark measured about 650–700 ms cold and 27 ms warm in a persistent process. All 1,216 Fleet test cones currently widen to the whole tree, so this version has demonstrated no test reuse on that corpus. The example rules are a starter pack, not a complete port of Fleet's checks. The replay simulator has only been tested on synthetic ledgers.
+What has been measured, on one private Python repository of about 4,000 files and 1,216 test modules:
+
+- **No test reuse.** Under the default strict cone model every test cone on that repository depends on the whole tree, because the support module every test imports reads the whole tree. None of that repository's 37 dynamic-loader declarations can be verified from source. `landd` would rerun every test for every candidate there.
+- **Sweep time.** About 0.9 s cold and 0.16 s warm for a one-shot `landd sweep`; an incremental sweep parses only the changed blobs. The latency figures in the first SPEC were goals, were not met, and have been withdrawn.
+- **No savings claim.** The real land ledger does not record which test modules each run selected, so the replay reports itself unavailable instead of estimating. The simulator's model is exercised on synthetic ledgers only.
+
+Units run in a `bwrap` sandbox by default and receipts can only be signed in that mode. `isolation = "none"` runs units as ordinary child processes and is for trusted code only. The example rules are a starter pack, not a port of any project's checks.
 
 ## Build and inspect
 
-Use a Linux build host with Rust and Git installed:
+Use a Linux build host with Rust, Git 2.40 or newer and, for the default isolation mode, bubblewrap:
 
 ```sh
 cargo build --release --locked -p landd
@@ -21,7 +27,7 @@ cargo build --release --locked -p landd
 ./target/release/landd cones --repo /path/to/repository --base HEAD~1 --head HEAD --json
 ```
 
-The workspace contains `landd-core`, `ast-sweep`, `landd-train`, `landd-sim`, and the `landd` CLI/daemon. See [SPEC.md](SPEC.md) for the design contract and [examples/landd.toml](examples/landd.toml) for configuration. SPEC latency figures are targets, not benchmark results.
+The workspace contains `landd-core`, `ast-sweep`, `landd-train`, `landd-sim`, and the `landd` CLI/daemon. See [SPEC.md](SPEC.md) for the design contract and [examples/landd.toml](examples/landd.toml) for configuration. Measurements are in [HARDENING.md](HARDENING.md).
 
 ## License
 

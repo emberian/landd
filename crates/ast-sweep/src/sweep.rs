@@ -2,8 +2,8 @@
 
 use crate::cache::{BlobFactsCache, Pack};
 use crate::extract::extract;
-use crate::facts::{FileFacts, FileKind};
-use crate::imports::{self, ImportCone, ImportGraph};
+use crate::facts::{FileFacts, FileKind, Language, MODE_EXECUTABLE, MODE_SYMLINK};
+use crate::imports::{self, Cause, ImportCone, ImportGraph, LoaderReport};
 use crate::reduce::{self, Catalogs, RuleVerdict, VerdictStatus};
 use crate::rules::RulePack;
 use landd_core::git::{EntryKind, GitError, GitRepo};
@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-const SYMLINK_MODE: u32 = 0o120000;
+/// A link target longer than this is not a path.
+const MAX_LINK_BYTES: u64 = 4096;
 /// Parse sets up to this size run on the light pool.
 const SMALL_PARSE: usize = 16;
 
@@ -28,6 +29,8 @@ pub enum SweepError {
     Reader(String),
     #[error("reading {path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
+    #[error("path {0:?} is not UTF-8; refusing to guess which file it names")]
+    NonUtf8Path(String),
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +40,21 @@ pub struct FileEntry {
     pub mode: u32,
     pub kind: Option<FileKind>,
     pub facts: Option<Arc<FileFacts>>,
+}
+
+impl FileEntry {
+    /// Python by name, or by its `#!` line.
+    pub fn is_python(&self) -> bool {
+        match self.kind {
+            Some(FileKind::Python) => true,
+            Some(FileKind::Sniff) => self.facts.as_deref().is_some_and(|f| f.language == Language::Python),
+            _ => false,
+        }
+    }
+
+    pub fn is_recipe(&self) -> bool {
+        self.kind == Some(FileKind::Recipe) || self.facts.as_deref().is_some_and(|f| f.language == Language::Recipe)
+    }
 }
 
 /// Every file of one tree, in byte order of path, with the facts of the
@@ -60,16 +78,23 @@ impl AllFacts {
         self.files.iter().map(|f| f.path.as_str()).collect()
     }
 
-    /// Facts for an in-memory tree of `(path, content)`.
+    /// Facts for an in-memory tree of `(path, content)` regular files.
     pub fn from_sources(sources: &[(&str, &str)]) -> Self {
-        let mut files: Vec<FileEntry> = sources
+        let entries: Vec<(&str, u32, &str)> = sources.iter().map(|(path, content)| (*path, 0o100644, *content)).collect();
+        Self::from_entries(&entries)
+    }
+
+    /// Facts for an in-memory tree of `(path, git mode, content)`; a
+    /// symbolic link's content is its target.
+    pub fn from_entries(entries: &[(&str, u32, &str)]) -> Self {
+        let mut files: Vec<FileEntry> = entries
             .iter()
-            .map(|(path, content)| {
-                let kind = FileKind::of_path(path);
+            .map(|(path, mode, content)| {
+                let kind = FileKind::of_entry(path, *mode);
                 FileEntry {
                     path: (*path).to_owned(),
                     oid: Oid::git_blob_sha1(content.as_bytes()),
-                    mode: 0o100644,
+                    mode: *mode,
                     kind,
                     facts: kind.map(|k| Arc::new(extract(k, content.as_bytes()))),
                 }
@@ -156,20 +181,19 @@ fn starts_pack(name: &str) -> bool {
 /// Sweep the tree of `rev` straight from the object store.
 pub fn sweep_git(repo: &GitRepo, rev: &str, cache: Option<&BlobFactsCache>) -> Result<(AllFacts, SweepStats), SweepError> {
     let started = Instant::now();
-    let (root, listing) = std::thread::scope(|scope| {
-        let root = scope.spawn(|| repo.tree_of(rev));
-        let listing = repo.ls_tree(rev, false);
-        (root.join().expect("rev-parse thread"), listing)
-    });
-    let (root, listing) = (root?, listing?);
+    // The revision is resolved to a tree exactly once; a ref that moves
+    // while the sweep runs cannot make the listing and the id disagree.
+    let root = repo.blob_reader()?.resolve_tree(rev)?;
+    let listing = repo.ls_tree(&root.to_hex(), false)?;
     let mut stats = SweepStats { list_ms: ms_since(started), ..SweepStats::default() };
     let mapping = Instant::now();
 
     let mut files: Vec<FileEntry> = listing
         .into_iter()
-        .filter(|entry| entry.kind == EntryKind::Blob)
+        // Gitlinks stay: bumping a submodule changes the tree units run on.
+        .filter(|entry| entry.kind != EntryKind::Tree)
         .map(|entry| FileEntry {
-            kind: if entry.mode == SYMLINK_MODE { None } else { FileKind::of_path(&entry.path) },
+            kind: FileKind::of_entry(&entry.path, entry.mode),
             path: entry.path,
             oid: entry.oid,
             mode: entry.mode,
@@ -248,7 +272,17 @@ pub fn sweep_git(repo: &GitRepo, rev: &str, cache: Option<&BlobFactsCache>) -> R
                 |reader, (g, s)| {
                     let reader = reader.as_mut().map_err(|e| SweepError::Reader(e.to_string()))?;
                     let (oid, kind) = groups[*g].keys[*s];
-                    let facts = extract(kind, &reader.read(&oid)?);
+                    let limit = if kind == FileKind::Link { MAX_LINK_BYTES } else { landd_core::git::DEFAULT_MAX_BLOB_BYTES };
+                    let facts = match reader.read_limited(&oid, Some(limit)) {
+                        Ok(bytes) => extract(kind, &bytes),
+                        // Not read: whoever reaches this file cannot be bounded.
+                        Err(GitError::TooLarge { .. }) => FileFacts {
+                            too_large: true,
+                            language: if kind == FileKind::Python { Language::Python } else { Language::Other },
+                            ..FileFacts::default()
+                        },
+                        Err(other) => return Err(other.into()),
+                    };
                     if let Some(cache) = cache {
                         if cache.put_blob(kind, &oid, &facts).is_err() {
                             write_errors.fetch_add(1, Ordering::Relaxed);
@@ -292,11 +326,8 @@ pub fn sweep_git(repo: &GitRepo, rev: &str, cache: Option<&BlobFactsCache>) -> R
         .collect();
     stats.cache_write_errors = write_errors.into_inner();
 
-    let placements: Vec<(usize, Arc<FileFacts>)> = groups
-        .iter()
-        .zip(&packs)
-        .flat_map(|(group, pack)| group.members.iter().copied().zip(pack.iter().cloned()))
-        .collect();
+    let placements: Vec<(usize, Arc<FileFacts>)> =
+        groups.iter().zip(&packs).flat_map(|(group, pack)| group.members.iter().copied().zip(pack.iter().cloned())).collect();
     for (index, facts) in placements {
         files[index].facts = Some(facts);
     }
@@ -308,7 +339,9 @@ fn walk(dir: &Path, relative: &str, out: &mut Vec<(String, PathBuf)>) -> Result<
     let io = |source| SweepError::Io { path: dir.to_owned(), source };
     for entry in std::fs::read_dir(dir).map_err(io)? {
         let entry = entry.map_err(io)?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(name) = entry.file_name().into_string() else {
+            return Err(SweepError::NonUtf8Path(entry.path().to_string_lossy().into_owned()));
+        };
         if name == ".git" {
             continue;
         }
@@ -316,7 +349,8 @@ fn walk(dir: &Path, relative: &str, out: &mut Vec<(String, PathBuf)>) -> Result<
         let kind = entry.file_type().map_err(io)?;
         if kind.is_dir() {
             walk(&entry.path(), &child, out)?;
-        } else {
+        } else if kind.is_file() || kind.is_symlink() {
+            // Sockets, FIFOs and devices are not content; reading one could block forever.
             out.push((child, entry.path()));
         }
     }
@@ -343,15 +377,14 @@ pub fn sweep_dir(dir: &Path, cache: Option<&BlobFactsCache>) -> Result<(AllFacts
             .map(|(path, full)| {
                 let io = |source| SweepError::Io { path: full.clone(), source };
                 let meta = std::fs::symlink_metadata(full).map_err(io)?;
-                if meta.file_type().is_symlink() {
-                    let target = std::fs::read_link(full).map_err(io)?;
-                    let oid = Oid::git_blob_sha1(target.as_os_str().as_bytes());
-                    return Ok(FileEntry { path: path.clone(), oid, mode: SYMLINK_MODE, kind: None, facts: None });
-                }
-                let content = std::fs::read(full).map_err(io)?;
+                let (content, mode) = if meta.file_type().is_symlink() {
+                    (std::fs::read_link(full).map_err(io)?.as_os_str().as_bytes().to_vec(), MODE_SYMLINK)
+                } else {
+                    let executable = meta.permissions().mode() & 0o111 != 0;
+                    (std::fs::read(full).map_err(io)?, if executable { MODE_EXECUTABLE } else { 0o100644 })
+                };
                 let oid = Oid::git_blob_sha1(&content);
-                let mode = if meta.permissions().mode() & 0o111 != 0 { 0o100755 } else { 0o100644 };
-                let kind = FileKind::of_path(path);
+                let kind = FileKind::of_entry(path, mode);
                 let facts = kind.map(|kind| {
                     if let Some((hit, _)) = cache.and_then(|c| c.get_blob(kind, &oid)) {
                         cached.fetch_add(1, Ordering::Relaxed);
@@ -382,10 +415,11 @@ pub enum Source<'a> {
     Dir(&'a Path),
 }
 
-/// An undeclared dynamic loader and how many cones it taints.
+/// One reason cones were widened, and how many cones it widened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct TaintSource {
+pub struct Widening {
     pub path: String,
+    pub cause: Cause,
     pub cones: usize,
 }
 
@@ -397,7 +431,7 @@ pub struct SweepReport {
     pub census: BTreeMap<&'static str, usize>,
     /// Reading the settings catalogs the pack names.
     pub catalogs_ms: f64,
-    /// Building the import graph (only when the pack exports cones).
+    /// Building the dependency graph (only when the pack exports cones).
     pub graph_ms: f64,
     pub reduce_ms: f64,
     /// Milliseconds per rule; rules run in parallel, so these overlap.
@@ -407,10 +441,14 @@ pub struct SweepReport {
     pub rules_failed: usize,
     pub findings: usize,
     pub verdicts: Vec<RuleVerdict>,
-    pub tainted_cones: usize,
-    /// Loaders ranked by the cones they taint: declare the top ones in
-    /// `[imports.loaders]` to give those cones back their static bounds.
-    pub taint_sources: Vec<TaintSource>,
+    /// Cones that depend on the whole tree.
+    pub widened_cones: usize,
+    /// How many widened cones each cause accounts for (a cone may have several).
+    pub widened_by_cause: BTreeMap<Cause, usize>,
+    /// The files that widen the most cones, with why.
+    pub widening: Vec<Widening>,
+    /// What became of each loader declaration on this tree.
+    pub loaders: Vec<LoaderReport>,
     pub cones: Vec<ImportCone>,
 }
 
@@ -420,7 +458,8 @@ fn census(all: &AllFacts) -> BTreeMap<&'static str, usize> {
         for (name, count) in [
             ("imports", facts.imports.len()),
             ("dynamic_loads", facts.dynamic_loads.len()),
-            ("scans", facts.scans.len()),
+            ("reads", facts.reads.len()),
+            ("scans", facts.scans().count()),
             ("flocks", facts.flocks.len()),
             ("replaces", facts.replaces.len()),
             ("strftimes", facts.strftimes.len()),
@@ -458,7 +497,8 @@ pub fn run_sweep(
     let catalogs_ms = ms_since(cataloguing);
 
     let graphing = Instant::now();
-    let graph = pack.exports_cones().then(|| ImportGraph::build(&all, &pack.imports));
+    let graph = pack.needs_graph().then(|| ImportGraph::build(&all, &pack.imports));
+    let cone_graph = graph.as_ref().filter(|_| pack.exports_cones());
     let graph_ms = ms_since(graphing);
 
     let reducing = Instant::now();
@@ -466,27 +506,31 @@ pub fn run_sweep(
     let reduce_ms = ms_since(reducing);
 
     let coning = Instant::now();
-    let cones = graph.as_ref().map(|g| imports::cones(&all, g, &pack.imports)).unwrap_or_default();
+    let context = pack.digest();
+    let cones = cone_graph.map(|g| imports::cones(&all, g, &pack.imports, &context)).unwrap_or_default();
     let cones_ms = ms_since(coning);
 
-    let mut tainted_by: BTreeMap<u32, usize> = BTreeMap::new();
-    for source in cones.iter().flat_map(|cone| &cone.taint_sources) {
-        *tainted_by.entry(*source).or_insert(0) += 1;
+    let mut widened_by_cause: BTreeMap<Cause, usize> = BTreeMap::new();
+    for cone in &cones {
+        let kinds: std::collections::BTreeSet<Cause> = cone.causes.iter().map(|(_, cause)| *cause).collect();
+        for cause in kinds {
+            *widened_by_cause.entry(cause).or_insert(0) += 1;
+        }
     }
-    let mut taint_sources: Vec<TaintSource> = tainted_by
-        .into_iter()
-        .map(|(file, cones)| TaintSource { path: all.files[file as usize].path.clone(), cones })
-        .collect();
-    taint_sources.sort_by(|a, b| b.cones.cmp(&a.cones).then_with(|| a.path.cmp(&b.path)));
-    taint_sources.truncate(40);
+    let mut widening: Vec<Widening> =
+        imports::cause_counts(&cones, &all).into_iter().map(|((path, cause), cones)| Widening { path, cause, cones }).collect();
+    widening.sort_by(|a, b| b.cones.cmp(&a.cones).then_with(|| a.path.cmp(&b.path)).then_with(|| a.cause.cmp(&b.cause)));
+    widening.truncate(60);
 
     let report = SweepReport {
         tree: all.tree,
         stats,
         census: census(&all),
         catalogs_ms,
-        tainted_cones: cones.iter().filter(|cone| cone.dynamic_loads).count(),
-        taint_sources,
+        widened_cones: cones.iter().filter(|cone| cone.widened).count(),
+        widened_by_cause,
+        widening,
+        loaders: cone_graph.map(|g| g.loaders.clone()).unwrap_or_default(),
         graph_ms,
         reduce_ms,
         rule_ms,
@@ -520,7 +564,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), FILES);
         let repo = sandbox.repo();
-        let cache = BlobFactsCache::open(dir.path().join("cache"));
+        let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
 
         let (cold, cold_stats) = sweep_git(&repo, "HEAD", Some(&cache)).unwrap();
         assert_eq!((cold_stats.files, cold_stats.fact_files), (7, 5));
@@ -538,7 +582,7 @@ mod tests {
         let (warm, warm_stats) = sweep_git(&repo, "HEAD", Some(&cache)).unwrap();
         assert_eq!((warm_stats.blobs_parsed, warm_stats.blobs_from_cache), (0, 0));
         assert_eq!((warm_stats.packs_hit, warm_stats.packs_from_memory), (packs, packs));
-        let cache = BlobFactsCache::open(dir.path().join("cache"));
+        let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
         let (_, disk_stats) = sweep_git(&repo, "HEAD", Some(&cache)).unwrap();
         assert_eq!((disk_stats.blobs_parsed, disk_stats.packs_hit, disk_stats.packs_from_memory), (0, packs, 0));
         for (a, b) in cold.files.iter().zip(&warm.files) {
@@ -575,7 +619,7 @@ mod tests {
     fn directory_mode_matches_git_mode_and_shares_the_blob_cache() {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path(), FILES);
-        let cache = BlobFactsCache::open(dir.path().join("cache"));
+        let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
         let (from_git, _) = sweep_git(&sandbox.repo(), "HEAD", Some(&cache)).unwrap();
         let (from_dir, stats) = sweep_dir(&sandbox.work, Some(&cache)).unwrap();
         assert_eq!((stats.blobs_parsed, stats.blobs_from_cache), (0, 5));
@@ -614,13 +658,13 @@ mod tests {
         let borrowed: Vec<(&str, &str)> = sources.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
         let sandbox = Sandbox::new(dir.path(), &borrowed);
         let repo = sandbox.repo();
-        let cache = BlobFactsCache::open(dir.path().join("cache"));
+        let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
         let (_, cold) = sweep_git(&repo, "HEAD", Some(&cache)).unwrap();
         assert!(cold.packs >= 30, "400 siblings must be cut into many packs, got {}", cold.packs);
 
         // Edit one file, add one and delete one: boundaries elsewhere hold.
         sandbox.commit("main", "edit", &[("big/mod_200.py", "X = -1\n"), ("big/mod_200a.py", "NEW = 1\n")], &["big/mod_017.py"]);
-        let cache = BlobFactsCache::open(dir.path().join("cache"));
+        let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
         let (_, next) = sweep_git(&repo, "HEAD", Some(&cache)).unwrap();
         assert_eq!(next.blobs_parsed, 2);
         assert!(next.packs - next.packs_hit <= 3, "{} of {} packs missed", next.packs - next.packs_hit, next.packs);
@@ -633,5 +677,52 @@ mod tests {
         assert_eq!((held.blobs_parsed, held.blobs_from_cache), (1, 0));
         assert_eq!(held.packs_hit, held.packs_from_memory);
         assert_eq!(held.packs - held.packs_hit, 1);
+    }
+
+    /// Real git modes: a symbolic link, an executable Python script without
+    /// a suffix, and a tree listed from a subdirectory.
+    #[test]
+    fn git_modes_links_and_sniffed_scripts_are_read_as_what_they_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox =
+            Sandbox::new(dir.path(), &[("lib/impl.py", "I = 1\n"), ("bin/tool", "#!/usr/bin/env python3\nimport lib.impl\n")]);
+        std::os::unix::fs::symlink("../lib/impl.py", sandbox.work.join("bin/linked.py")).unwrap();
+        std::fs::set_permissions(sandbox.work.join("bin/tool"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        sandbox.git(&["add", "-A"]);
+        sandbox.git(&["commit", "--quiet", "-m", "modes"]);
+        let repo = landd_core::git::GitRepo::open(sandbox.work.join("lib")).unwrap();
+        let (all, stats) = sweep_git(&repo, "HEAD", None).unwrap();
+        assert_eq!(stats.files, 3);
+        let tool = all.find("bin/tool").unwrap();
+        assert_eq!((tool.mode, tool.kind, tool.is_python()), (MODE_EXECUTABLE, Some(FileKind::Sniff), true));
+        let link = all.find("bin/linked.py").unwrap();
+        assert_eq!((link.mode, link.kind, link.is_python()), (MODE_SYMLINK, Some(FileKind::Link), false));
+        assert_eq!(link.facts.as_ref().unwrap().link_target.as_deref(), Some("../lib/impl.py"));
+        // The working-tree mode reads the same tree the same way.
+        let (from_dir, _) = sweep_dir(&sandbox.work, None).unwrap();
+        for (a, b) in all.files.iter().zip(&from_dir.files) {
+            assert_eq!(
+                (&a.path, a.oid, a.mode, a.kind, a.facts.as_deref()),
+                (&b.path, b.oid, b.mode, b.kind, b.facts.as_deref())
+            );
+        }
+    }
+
+    #[test]
+    fn tooth_directory_mode_skips_what_is_not_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "A = 1\n").unwrap();
+        let fifo = std::ffi::CString::new(dir.path().join("pipe.py").to_str().unwrap()).unwrap();
+        // SAFETY: `mkfifo` is given a valid NUL-terminated path owned by this scope.
+        assert_eq!(unsafe { libc_mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        let (all, _) = sweep_dir(dir.path(), None).unwrap();
+        assert_eq!(all.paths(), ["a.py"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    extern "C" {
+        #[link_name = "mkfifo"]
+        fn libc_mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
     }
 }

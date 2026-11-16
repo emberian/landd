@@ -9,7 +9,9 @@
 //! any state ──complete(ancestry evidence)──▶ Completed
 //! ```
 //!
-//! `Declined` is terminal against `start`, `refused` and `declined`.
+//! `Declined` is terminal against `start`, `refused` and `declined`, and can
+//! only be entered from `Fresh` or `Refused`: while a send is outstanding
+//! (`Unknown`) the destination has to be read first.
 //! `Completed` is terminal against everything. Completion needs proof that
 //! the lane tip is an ancestor of the target ref on the destination, and with
 //! that proof it wins from every state (`confirmation_wins`): a decline
@@ -34,9 +36,15 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// `BLAKE3(canonical_binding)`.
+    /// Domain-separated BLAKE3 of the canonical binding.
     pub fn key(&self) -> Digest32 {
-        Digest32::blake3(&canonical_json(self).expect("a binding has no floats"))
+        Digest32::tagged("landd delivery binding v1", &[&canonical_json(self).expect("a binding has no floats")])
+    }
+
+    /// Key of the pointer that names the latest binding made for this lane
+    /// tip on this destination, whatever base it was composed against.
+    pub fn tip_key(repo: &str, target_ref: &str, lane_tip: &Oid) -> Digest32 {
+        Digest32::tagged("landd delivery tip pointer v1", &[repo.as_bytes(), target_ref.as_bytes(), lane_tip.as_bytes()])
     }
 }
 
@@ -44,6 +52,8 @@ impl Binding {
 /// `remote_head`, the value of `target_ref` on the forge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AncestryEvidence {
+    /// The destination the ref was read from (the binding's `repo`).
+    pub repo: String,
     pub target_ref: String,
     pub remote_head: Oid,
     pub lane_tip: Oid,
@@ -52,10 +62,22 @@ pub struct AncestryEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum DeclineEvidence {
-    Conflict { conflicting_paths: Vec<String> },
-    NewRed { why_not: Vec<Blocker> },
-    RefusalsExhausted { attempts: u32 },
-    Other { detail: String },
+    Conflict {
+        conflicting_paths: Vec<String>,
+    },
+    NewRed {
+        why_not: Vec<Blocker>,
+    },
+    /// The tip cannot be merged at all (missing object, unrelated history).
+    Unmergeable {
+        detail: String,
+    },
+    RefusalsExhausted {
+        attempts: u32,
+    },
+    Other {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,9 +87,16 @@ pub enum DeliveryState {
     /// A send was started and its outcome has not been read from the destination.
     Unknown,
     /// The destination was read and does not hold the commit; retry at `not_before`.
-    Refused { attempts: u32, not_before: u64 },
-    Declined { evidence: DeclineEvidence },
-    Completed { evidence: AncestryEvidence },
+    Refused {
+        attempts: u32,
+        not_before: u64,
+    },
+    Declined {
+        evidence: DeclineEvidence,
+    },
+    Completed {
+        evidence: AncestryEvidence,
+    },
 }
 
 impl DeliveryState {
@@ -94,7 +123,9 @@ pub enum DeliveryError {
     Completed,
     #[error("{op} is not valid from {from}")]
     Invalid { op: &'static str, from: &'static str },
-    #[error("evidence is for another lane tip or target ref")]
+    #[error("the send counter of this delivery is exhausted")]
+    SendsExhausted,
+    #[error("evidence is for another destination, lane tip or target ref")]
     EvidenceMismatch,
 }
 
@@ -121,15 +152,15 @@ impl Delivery {
         match &self.state {
             DeliveryState::Fresh => {}
             DeliveryState::Refused { not_before, .. } if now >= *not_before => {}
-            DeliveryState::Refused { not_before, .. } => {
-                return Err(DeliveryError::NotBefore { not_before: *not_before, now })
-            }
+            DeliveryState::Refused { not_before, .. } => return Err(DeliveryError::NotBefore { not_before: *not_before, now }),
             DeliveryState::Unknown => return Err(DeliveryError::OutcomeUnknown),
             DeliveryState::Declined { .. } => return Err(DeliveryError::Declined("start")),
             DeliveryState::Completed { .. } => return Err(DeliveryError::Completed),
         }
+        // A counter at its limit refuses the send and leaves the record as
+        // it is; it never wraps back to "no sends yet".
         let mut next = self.next(DeliveryState::Unknown);
-        next.sends += 1;
+        next.sends = self.sends.checked_add(1).ok_or(DeliveryError::SendsExhausted)?;
         Ok(next)
     }
 
@@ -145,9 +176,9 @@ impl Delivery {
 
     pub fn declined(&self, evidence: DeclineEvidence) -> Result<Self, DeliveryError> {
         match &self.state {
-            DeliveryState::Fresh | DeliveryState::Unknown | DeliveryState::Refused { .. } => {
-                Ok(self.next(DeliveryState::Declined { evidence }))
-            }
+            DeliveryState::Fresh | DeliveryState::Refused { .. } => Ok(self.next(DeliveryState::Declined { evidence })),
+            // The send may have landed: only the destination can say.
+            DeliveryState::Unknown => Err(DeliveryError::OutcomeUnknown),
             DeliveryState::Declined { .. } => Err(DeliveryError::Declined("declined")),
             DeliveryState::Completed { .. } => Err(DeliveryError::Completed),
         }
@@ -156,7 +187,10 @@ impl Delivery {
     /// Destination completion dominates: succeeds from every state, given
     /// evidence for this binding. Completing twice keeps the first evidence.
     pub fn complete(&self, evidence: AncestryEvidence) -> Result<Self, DeliveryError> {
-        if evidence.lane_tip != self.binding.lane_tip || evidence.target_ref != self.binding.target_ref {
+        if evidence.repo != self.binding.repo
+            || evidence.lane_tip != self.binding.lane_tip
+            || evidence.target_ref != self.binding.target_ref
+        {
             return Err(DeliveryError::EvidenceMismatch);
         }
         match &self.state {
@@ -200,6 +234,12 @@ struct Record {
     delivery: Delivery,
 }
 
+#[derive(Serialize, Deserialize)]
+struct TipRecord {
+    rev: u64,
+    binding: Binding,
+}
+
 /// Append-only, bounded, per-key journal: `<root>/ab/cd/<key>/r<rev>.json`.
 ///
 /// Each revision is created exclusively, so two writers racing from the same
@@ -219,23 +259,31 @@ impl DeliveryJournal {
         Self { root: root.into() }
     }
 
-    fn rev_path(&self, key: &Digest32, rev: u64) -> PathBuf {
+    fn log_dir(&self, space: &str, key: &Digest32) -> PathBuf {
         let hex = key.to_hex();
-        self.root.join(&hex[..2]).join(&hex[2..4]).join(&hex).join(format!("r{rev:08}.json"))
+        self.root.join(space).join(&hex[..2]).join(&hex[2..4]).join(&hex)
     }
 
-    fn exists(&self, key: &Digest32, rev: u64) -> Result<bool, JournalError> {
-        let path = self.rev_path(key, rev);
-        path.try_exists().map_err(|source| JournalError::Io { path, source })
+    fn rev_path(&self, key: &Digest32, rev: u64) -> PathBuf {
+        self.log_dir("bindings", key).join(format!("r{rev:08}.json"))
     }
 
-    /// Highest revision on disk, 0 when there is none.
-    fn latest_rev(&self, key: &Digest32) -> Result<u64, JournalError> {
-        if !self.exists(key, 1)? {
+    fn tip_path(&self, key: &Digest32, rev: u64) -> PathBuf {
+        self.log_dir("tips", key).join(format!("r{rev:08}.json"))
+    }
+
+    /// Highest revision on disk, 0 when there is none. `path_of` names the
+    /// file of a revision; revisions are dense, so existence is monotone.
+    fn latest(path_of: impl Fn(u64) -> PathBuf) -> Result<u64, JournalError> {
+        let exists = |rev: u64| {
+            let path = path_of(rev);
+            path.try_exists().map_err(|source| JournalError::Io { path, source })
+        };
+        if !exists(1)? {
             return Ok(0);
         }
         let (mut low, mut high) = (1u64, 2u64);
-        while high <= MAX_REVISIONS && self.exists(key, high)? {
+        while high <= MAX_REVISIONS && exists(high)? {
             low = high;
             high *= 2;
         }
@@ -243,13 +291,63 @@ impl DeliveryJournal {
         let mut high = high.min(MAX_REVISIONS + 1);
         while high - low > 1 {
             let mid = low + (high - low) / 2;
-            if self.exists(key, mid)? {
+            if exists(mid)? {
                 low = mid;
             } else {
                 high = mid;
             }
         }
         Ok(low)
+    }
+
+    fn latest_rev(&self, key: &Digest32) -> Result<u64, JournalError> {
+        Self::latest(|rev| self.rev_path(key, rev))
+    }
+
+    /// Durably record `binding` as the latest one made for its lane tip.
+    /// Call this before `start`: after a crash, or after the base moved and
+    /// the next composition has a different key, [`Self::latest_for_tip`]
+    /// still finds the send whose outcome was never read.
+    pub fn note_tip(&self, binding: &Binding) -> Result<(), JournalError> {
+        let key = Binding::tip_key(&binding.repo, &binding.target_ref, &binding.lane_tip);
+        for _ in 0..CAS_ATTEMPTS {
+            let rev = Self::latest(|rev| self.tip_path(&key, rev))?;
+            if rev > 0 && self.read_tip(&key, rev)? == *binding {
+                return Ok(());
+            }
+            if rev >= MAX_REVISIONS {
+                return Err(JournalError::Full { key, bound: MAX_REVISIONS });
+            }
+            let path = self.tip_path(&key, rev + 1);
+            let bytes = canonical_json(&TipRecord { rev: rev + 1, binding: binding.clone() })
+                .map_err(|e| JournalError::Corrupt { path: path.clone(), detail: e.to_string() })?;
+            if fsx::create_exclusive(&path, &bytes).map_err(|source| JournalError::Io { path, source })? {
+                return Ok(());
+            }
+        }
+        Err(JournalError::Contended { key, attempts: CAS_ATTEMPTS })
+    }
+
+    fn read_tip(&self, key: &Digest32, rev: u64) -> Result<Binding, JournalError> {
+        let path = self.tip_path(key, rev);
+        let bytes = std::fs::read(&path).map_err(|source| JournalError::Io { path: path.clone(), source })?;
+        let record: TipRecord =
+            serde_json::from_slice(&bytes).map_err(|e| JournalError::Corrupt { path: path.clone(), detail: e.to_string() })?;
+        if record.rev != rev {
+            return Err(JournalError::Corrupt { path, detail: format!("holds revision {}", record.rev) });
+        }
+        Ok(record.binding)
+    }
+
+    /// The latest delivery recorded for a lane tip on a destination.
+    pub fn latest_for_tip(&self, repo: &str, target_ref: &str, lane_tip: &Oid) -> Result<Option<Stored>, JournalError> {
+        let key = Binding::tip_key(repo, target_ref, lane_tip);
+        let rev = Self::latest(|rev| self.tip_path(&key, rev))?;
+        if rev == 0 {
+            return Ok(None);
+        }
+        let binding = self.read_tip(&key, rev)?;
+        self.load(&binding).map(Some)
     }
 
     fn read_rev(&self, key: &Digest32, rev: u64) -> Result<Delivery, JournalError> {
@@ -284,7 +382,10 @@ impl DeliveryJournal {
 
     /// Apply a transition and persist it with compare-and-swap. When another
     /// writer advances the key first, the transition is re-applied to the
-    /// state that writer left.
+    /// state that writer left. A transition that changes nothing writes
+    /// nothing and returns the state as read; that read can be stale only in
+    /// the sense that a later writer may already have moved on, which every
+    /// caller must tolerate anyway.
     pub fn transition(
         &self,
         binding: &Binding,
@@ -343,7 +444,7 @@ mod tests {
     }
 
     fn landed(b: &Binding) -> AncestryEvidence {
-        AncestryEvidence { target_ref: b.target_ref.clone(), remote_head: oid(200), lane_tip: b.lane_tip }
+        AncestryEvidence { repo: b.repo.clone(), target_ref: b.target_ref.clone(), remote_head: oid(200), lane_tip: b.lane_tip }
     }
 
     fn conflict() -> DeclineEvidence {
@@ -388,9 +489,12 @@ mod tests {
         let b = binding(2);
         let other_tip = AncestryEvidence { lane_tip: oid(9), ..landed(&b) };
         let other_ref = AncestryEvidence { target_ref: "refs/heads/release".into(), ..landed(&b) };
+        // The same commits on a fork or mirror are not this delivery.
+        let other_repo = AncestryEvidence { repo: "mirror".into(), ..landed(&b) };
         for state in [Delivery::fresh(b.clone()), Delivery::fresh(b.clone()).start(0).unwrap()] {
             assert_eq!(state.complete(other_tip.clone()), Err(DeliveryError::EvidenceMismatch));
             assert_eq!(state.complete(other_ref.clone()), Err(DeliveryError::EvidenceMismatch));
+            assert_eq!(state.complete(other_repo.clone()), Err(DeliveryError::EvidenceMismatch));
         }
     }
 
@@ -464,10 +568,7 @@ mod tests {
         // A second process opening the same directory sees the outstanding send.
         let reopened = DeliveryJournal::open(dir.path());
         assert_eq!(reopened.load(&b).unwrap(), sent);
-        assert!(matches!(
-            reopened.transition(&b, |d| d.start(6)),
-            Err(JournalError::Delivery(DeliveryError::OutcomeUnknown))
-        ));
+        assert!(matches!(reopened.transition(&b, |d| d.start(6)), Err(JournalError::Delivery(DeliveryError::OutcomeUnknown))));
         let done = reopened.transition(&b, |d| d.complete(landed(&b))).unwrap();
         assert_eq!(done.rev, 2);
         assert_eq!(journal.load(&b).unwrap(), done);
@@ -496,10 +597,7 @@ mod tests {
         assert_ne!(key, b.key());
         journal.transition_keyed(&key, &a, |d| d.start(0)).unwrap();
         assert!(matches!(journal.load_keyed(&key, &b), Err(JournalError::BindingMismatch { .. })));
-        assert!(matches!(
-            journal.transition_keyed(&key, &b, |d| d.start(0)),
-            Err(JournalError::BindingMismatch { .. })
-        ));
+        assert!(matches!(journal.transition_keyed(&key, &b, |d| d.start(0)), Err(JournalError::BindingMismatch { .. })));
     }
 
     #[test]
@@ -522,11 +620,82 @@ mod tests {
         let b = binding(5);
         let journal = DeliveryJournal::open(dir.path());
         let wins: usize = std::thread::scope(|scope| {
-            let handles: Vec<_> =
-                (0..8).map(|_| scope.spawn(|| journal.transition(&b, |d| d.start(0)).is_ok())).collect();
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| journal.transition(&b, |d| d.start(0)).is_ok())).collect();
             handles.into_iter().map(|h| h.join().unwrap() as usize).sum()
         });
         assert_eq!(wins, 1);
         assert_eq!(journal.load(&b).unwrap().delivery.sends, 1);
+    }
+
+    #[test]
+    fn tooth_an_outstanding_send_cannot_be_declined_unread() {
+        let b = binding(2);
+        let unknown = Delivery::fresh(b.clone()).start(0).unwrap();
+        assert_eq!(unknown.declined(conflict()), Err(DeliveryError::OutcomeUnknown));
+        // Read the destination: it either holds the tip or it does not.
+        assert!(unknown.refused(1).unwrap().declined(conflict()).is_ok());
+        assert!(unknown.complete(landed(&b)).is_ok());
+    }
+
+    #[test]
+    fn binding_keys_are_domain_separated() {
+        let b = binding(2);
+        assert_ne!(b.key(), Digest32::blake3(&canonical_json(&b).unwrap()));
+        assert_ne!(b.key(), Binding::tip_key(&b.repo, &b.target_ref, &b.lane_tip));
+        assert_ne!(Binding::tip_key("repo", "refs/heads/main", &oid(2)), Binding::tip_key("repo2", "refs/heads/main", &oid(2)));
+    }
+
+    /// The recovery pointer: a send made against one base is found again
+    /// from the lane tip alone, after the base (and so the key) has changed.
+    #[test]
+    fn tooth_tip_pointer_finds_an_outstanding_send_across_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DeliveryJournal::open(dir.path());
+        let first = binding(2);
+        assert_eq!(journal.latest_for_tip(&first.repo, &first.target_ref, &first.lane_tip).unwrap(), None);
+        journal.note_tip(&first).unwrap();
+        journal.note_tip(&first).unwrap();
+        journal.transition(&first, |d| d.start(1)).unwrap();
+
+        // A new process, composing against a moved base, has another key.
+        let reopened = DeliveryJournal::open(dir.path());
+        let second = Binding { expected_old: oid(77), merged_head: oid(78), ..first.clone() };
+        assert_ne!(first.key(), second.key());
+        assert_eq!(reopened.load(&second).unwrap().delivery.state, DeliveryState::Fresh);
+        let outstanding = reopened.latest_for_tip(&first.repo, &first.target_ref, &first.lane_tip).unwrap().unwrap();
+        assert_eq!(outstanding.delivery.binding, first);
+        assert_eq!(outstanding.delivery.state, DeliveryState::Unknown);
+
+        // Once settled and rebound, the pointer names the new binding.
+        reopened.transition(&first, |d| d.refused(5)).unwrap();
+        reopened.note_tip(&second).unwrap();
+        let latest = reopened.latest_for_tip(&first.repo, &first.target_ref, &first.lane_tip).unwrap().unwrap();
+        assert_eq!(latest.delivery.binding, second);
+        assert_eq!(reopened.latest_for_tip("elsewhere", &first.target_ref, &first.lane_tip).unwrap(), None);
+    }
+
+    /// A record read from disk may hold any counter value.
+    #[test]
+    fn tooth_a_saturated_send_counter_refuses_instead_of_wrapping() {
+        let b = binding(2);
+        let text = serde_json::to_string(&Delivery {
+            binding: b.clone(),
+            state: DeliveryState::Refused { attempts: u32::MAX, not_before: 0 },
+            sends: u32::MAX,
+        })
+        .unwrap();
+        let saturated: Delivery = serde_json::from_str(&text).unwrap();
+        assert_eq!(saturated.start(10), Err(DeliveryError::SendsExhausted));
+        // Nothing else about the record is disturbed: it can still be declined or completed.
+        assert!(saturated.declined(conflict()).is_ok());
+        assert!(saturated.complete(landed(&b)).is_ok());
+        let one_left = Delivery { sends: u32::MAX - 1, ..saturated.clone() };
+        assert_eq!(one_left.start(10).unwrap().sends, u32::MAX);
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DeliveryJournal::open(dir.path());
+        journal.transition(&b, |_| Ok(saturated.clone())).unwrap();
+        assert!(matches!(journal.transition(&b, |d| d.start(10)), Err(JournalError::Delivery(DeliveryError::SendsExhausted))));
+        assert_eq!(journal.load(&b).unwrap().delivery, saturated);
     }
 }

@@ -4,11 +4,11 @@
 //! the map pass already extracted. A rule that cannot be evaluated (a missing
 //! catalog, a missing owner) fails with a finding that says so.
 
-use crate::facts::{FileFacts, FileKind, Site};
+use crate::cache::{BlobFactsCache, CatalogKeys};
+use crate::facts::{FileFacts, Site};
 use crate::glob::{Glob, GlobSet};
 use crate::imports::ImportGraph;
 use crate::rules::{FactSelector, Rule, RuleKind, RulePack};
-use crate::cache::{BlobFactsCache, CatalogKeys};
 use crate::sweep::{light_pool, AllFacts, FileEntry};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -150,7 +150,7 @@ fn scoped<'a>(all: &'a AllFacts, scope: &'a Scope) -> impl Iterator<Item = (&'a 
 }
 
 fn python<'a>(all: &'a AllFacts, scope: &'a Scope) -> impl Iterator<Item = (&'a FileEntry, &'a FileFacts)> + 'a {
-    scoped(all, scope).filter(|(file, _)| file.kind == Some(FileKind::Python))
+    scoped(all, scope).filter(|(file, _)| file.is_python())
 }
 
 pub fn reduce(all: &AllFacts, pack: &RulePack, catalogs: &Catalogs, graph: Option<&ImportGraph>) -> Vec<RuleVerdict> {
@@ -212,11 +212,25 @@ fn evaluate(all: &AllFacts, rule: &Rule, catalogs: &Catalogs, graph: Option<&Imp
             for (file, facts) in python(all, &scope) {
                 for site in facts.flocks.iter().filter(|s| !s.unlock) {
                     let place = if site.func.is_empty() { String::new() } else { format!(" in {}", site.func) };
-                    if !site.nonblocking && !owners.matches(&file.path) {
+                    if !site.nonblocking && !site.flags_opaque && !owners.matches(&file.path) {
                         out.push(finding(&file.path, site.line, format!("blocking {} without LOCK_NB{place}", site.call)));
                     }
+                    if site.flags_opaque && !owners.matches(&file.path) {
+                        out.push(finding(
+                            &file.path,
+                            site.line,
+                            format!(
+                                "{} flags are not visible here (a variable); cannot tell whether it blocks{place}",
+                                site.call
+                            ),
+                        ));
+                    }
                     if site.polled && !site.poll_bounded {
-                        out.push(finding(&file.path, site.line, format!("{} polled in a sleep loop with no bound{place}", site.call)));
+                        out.push(finding(
+                            &file.path,
+                            site.line,
+                            format!("{} polled in a sleep loop with no bound{place}", site.call),
+                        ));
                     }
                 }
             }
@@ -246,8 +260,7 @@ fn evaluate(all: &AllFacts, rule: &Rule, catalogs: &Catalogs, graph: Option<&Imp
                 }
             }
             // Catalog keys are sorted: a lookup is a binary search per catalog.
-            let catalogued =
-                |key: &str| known.iter().any(|keys| keys.binary_search_by(|probe| probe.as_str().cmp(key)).is_ok());
+            let catalogued = |key: &str| known.iter().any(|keys| keys.binary_search_by(|probe| probe.as_str().cmp(key)).is_ok());
             let ignored = GlobSet::new(&rule.ignore_keys);
             for (file, facts) in python(all, &scope) {
                 for read in &facts.settings_reads {
@@ -262,7 +275,7 @@ fn evaluate(all: &AllFacts, rule: &Rule, catalogs: &Catalogs, graph: Option<&Imp
                 }
             }
         }
-        RuleKind::ForbiddenSymbolOrCall => forbidden(all, rule, &scope, &mut out),
+        RuleKind::ForbiddenSymbolOrCall => forbidden(all, rule, &scope, graph, &mut out),
         RuleKind::SingleOwnerPattern => single_owner(all, rule, &scope, &mut out),
         RuleKind::PythonImportGraph => {
             for unresolved in graph.map(|g| g.unresolved_relative.as_slice()).unwrap_or_default() {
@@ -277,7 +290,7 @@ fn evaluate(all: &AllFacts, rule: &Rule, catalogs: &Catalogs, graph: Option<&Imp
     out
 }
 
-fn forbidden(all: &AllFacts, rule: &Rule, scope: &Scope, out: &mut Vec<Finding>) {
+fn forbidden(all: &AllFacts, rule: &Rule, scope: &Scope, graph: Option<&ImportGraph>, out: &mut Vec<Finding>) {
     let allowed = GlobSet::new(&rule.allow);
     let symbols: Vec<Glob> = rule.symbols.iter().map(|p| Glob::new(p)).collect();
     let imports = GlobSet::new(&rule.imports);
@@ -301,26 +314,59 @@ fn forbidden(all: &AllFacts, rule: &Rule, scope: &Scope, out: &mut Vec<Finding>)
                     out.push(finding(&file.path, symbol.line, format!("forbidden {verb} {}", symbol.name)));
                 }
             }
+            // Names reached through a relative import are spelled with
+            // leading dots; they sort first. Each is the absolute name it
+            // resolves to from this file.
+            for symbol in facts.symbols.iter().take_while(|s| s.name.starts_with('.')) {
+                let level = symbol.name.bytes().take_while(|b| *b == b'.').count();
+                let absolute =
+                    absolute_module(&file.path, graph, file_index(all, &file.path), level.min(255) as u8, &symbol.name[level..]);
+                if let Some(name) = absolute.filter(|name| (symbol.call || !rule.calls_only) && pattern.matches(name)) {
+                    let verb = if symbol.call { "call of" } else { "reference to" };
+                    out.push(finding(&file.path, symbol.line, format!("forbidden {verb} {name}")));
+                }
+            }
         }
         if !imports.is_empty() {
-            for import in facts.imports.iter().filter(|i| i.level == 0) {
-                let named = import.names.iter().map(|n| format!("{}.{n}", import.module));
-                if let Some(hit) = std::iter::once(import.module.clone()).chain(named).find(|m| imports.matches(m)) {
+            for import in &facts.imports {
+                // A relative import is the module it resolves to from here.
+                let module = match import.level {
+                    0 => Some(import.module.clone()),
+                    level => absolute_module(&file.path, graph, file_index(all, &file.path), level, &import.module),
+                };
+                let Some(module) = module else { continue };
+                // `import a.b.c` imports `a`, `a.b` and `a.b.c`; `from a import b` may import `a.b`.
+                let mut spelled: Vec<String> = module.match_indices('.').map(|(dot, _)| module[..dot].to_owned()).collect();
+                spelled.push(module.clone());
+                spelled.extend(import.names.iter().filter(|n| *n != "*").map(|n| format!("{module}.{n}")));
+                if let Some(hit) = spelled.into_iter().find(|m| imports.matches(m)) {
                     out.push(finding(&file.path, import.line, format!("forbidden import of {hit}")));
                 }
             }
         }
         for selector in &rule.facts {
-            let mut sites = |label: &str, sites: &[Site]| {
-                for site in sites {
-                    out.push(finding(&file.path, site.line, format!("forbidden {label}: {}{}", site.what, within(site))));
-                }
+            let mut sites = |label: &str, line: u32, func: &str, what: &str| {
+                let place = if func.is_empty() { String::new() } else { format!(" in {func}") };
+                out.push(finding(&file.path, line, format!("forbidden {label}: {what}{place}")));
             };
             match selector {
-                FactSelector::DynamicLoad => sites("dynamic load", &facts.dynamic_loads),
-                FactSelector::Scan => sites("tree scan", &facts.scans),
-                FactSelector::SysExecutable => sites("interpreter reference", &facts.sys_executable),
-                FactSelector::ExceptionStoredOnSelf => sites("exception stored on self", &facts.exc_on_self),
+                FactSelector::DynamicLoad => {
+                    facts.dynamic_loads.iter().for_each(|s| sites("dynamic load", s.line, &s.func, &s.what));
+                    for site in facts
+                        .reads
+                        .iter()
+                        .filter(|s| s.shape == crate::facts::ReadShape::Module && !s.reach.places.iter().any(|p| !p.open))
+                    {
+                        sites("dynamic load", site.line, &site.func, &site.what);
+                    }
+                }
+                FactSelector::Scan => facts.scans().for_each(|s| sites("tree scan", s.line, &s.func, &s.what)),
+                FactSelector::SysExecutable => {
+                    facts.sys_executable.iter().for_each(|s| sites("interpreter reference", s.line, &s.func, &s.what))
+                }
+                FactSelector::ExceptionStoredOnSelf => {
+                    facts.exc_on_self.iter().for_each(|s| sites("exception stored on self", s.line, &s.func, &s.what))
+                }
                 FactSelector::Strftime => {
                     for site in &facts.strftimes {
                         let format = site.format.as_deref().unwrap_or("<computed>");
@@ -335,6 +381,29 @@ fn forbidden(all: &AllFacts, rule: &Rule, scope: &Scope, out: &mut Vec<Finding>)
             }
         }
     }
+}
+
+fn file_index(all: &AllFacts, path: &str) -> u32 {
+    all.index_of(path).unwrap_or(0) as u32
+}
+
+/// The absolute module a relative import names from `path`, when the file
+/// has a module name under some root.
+fn absolute_module(path: &str, graph: Option<&ImportGraph>, file: u32, level: u8, module: &str) -> Option<String> {
+    let own = graph?.module_of(file)?;
+    let mut parts: Vec<&str> = own.split('.').collect();
+    if !path.ends_with("/__init__.py") && path != "__init__.py" {
+        parts.pop();
+    }
+    let up = level as usize - 1;
+    if up > parts.len() {
+        return None;
+    }
+    parts.truncate(parts.len() - up);
+    if !module.is_empty() {
+        parts.push(module);
+    }
+    Some(parts.join("."))
 }
 
 fn single_owner(all: &AllFacts, rule: &Rule, scope: &Scope, out: &mut Vec<Finding>) {
@@ -359,7 +428,11 @@ fn single_owner(all: &AllFacts, rule: &Rule, scope: &Scope, out: &mut Vec<Findin
         }
         for function in &facts.functions {
             if names.matches(&leaf(&function.name)) {
-                out.push(finding(&file.path, function.line, format!("{} is defined outside its owner {owner_path}", function.name)));
+                out.push(finding(
+                    &file.path,
+                    function.line,
+                    format!("{} is defined outside its owner {owner_path}", function.name),
+                ));
             } else if let Some(original) = owned.get(&function.body_hash) {
                 let message = format!("{} is a copy of {owner_path}::{original}", function.name);
                 out.push(finding(&file.path, function.line, message));
@@ -399,7 +472,10 @@ mod tests {
         let verdict = run(&files, Rule::new("r", RuleKind::NoTrackedBytecode));
         assert_eq!(verdict.status, VerdictStatus::Fail);
         assert_eq!(places(&verdict), [("__pycache__/c.txt", 0), ("b.pyo", 0), ("pkg/__pycache__/a.cpython-313.pyc", 0)]);
-        assert_eq!(run(&[("a.py", ""), ("pyc.txt", "")], Rule::new("r", RuleKind::NoTrackedBytecode)).status, VerdictStatus::Pass);
+        assert_eq!(
+            run(&[("a.py", ""), ("pyc.txt", "")], Rule::new("r", RuleKind::NoTrackedBytecode)).status,
+            VerdictStatus::Pass
+        );
     }
 
     #[test]
@@ -449,7 +525,8 @@ mod tests {
 
     #[test]
     fn uncatalogued_settings_keys() {
-        let catalogs = Catalogs::from_json(&[("settings.json", r#"{"land": {"run": {"hub_cpu_s": 600}}, "fabd.route": "land"}"#)]);
+        let catalogs =
+            Catalogs::from_json(&[("settings.json", r#"{"land": {"run": {"hub_cpu_s": 600}}, "fabd.route": "land"}"#)]);
         let source = "a = setting('land.run.hub_cpu_s')\nb = setting('land.run.typo')\nc = or_default('fabd.route', 1)\n\
                       d = thing.get('not.a.setting')\ne = setting('local.only')\n";
         let make = |r: &mut Rule| {
@@ -469,7 +546,10 @@ mod tests {
     #[test]
     fn forbidden_symbols_calls_imports_and_facts() {
         let files = [
-            ("fleetd/a.py", "import subprocess as sp\nfrom land import stopfacts\nsp.run(['x'])\nhandler = sp.Popen\nstopfacts.read()\n"),
+            (
+                "fleetd/a.py",
+                "import subprocess as sp\nfrom land import stopfacts\nsp.run(['x'])\nhandler = sp.Popen\nstopfacts.read()\n",
+            ),
             ("fleetd/ok.py", "import subprocess\nsubprocess.run(['x'])\n"),
             ("land/b.py", "import subprocess\nsubprocess.run(['x'])\n"),
         ];
@@ -487,16 +567,23 @@ mod tests {
         let calls_only = run(&files, Rule { calls_only: true, ..symbols });
         assert_eq!(places(&calls_only), [("fleetd/a.py", 3)]);
 
-        let reader = run(&files, rule(RuleKind::ForbiddenSymbolOrCall, |r| {
-            r.symbols = vec!["land.stopfacts.*".into()];
-            r.imports = vec!["land.stopfacts".into()];
-        }));
+        let reader = run(
+            &files,
+            rule(RuleKind::ForbiddenSymbolOrCall, |r| {
+                r.symbols = vec!["land.stopfacts.*".into()];
+                r.imports = vec!["land.stopfacts".into()];
+            }),
+        );
         assert_eq!(places(&reader), [("fleetd/a.py", 2), ("fleetd/a.py", 5)]);
 
         let facts = run(
-            &[("x.py", "import os, sys, time\nfor _ in os.walk('.'): pass\nexe = sys.executable\nt = time.strftime('%Y')\nexec(code)\n")],
+            &[(
+                "x.py",
+                "import os, sys, time\nfor _ in os.walk('.'): pass\nexe = sys.executable\nt = time.strftime('%Y')\nexec(code)\n",
+            )],
             rule(RuleKind::ForbiddenSymbolOrCall, |r| {
-                r.facts = vec![FactSelector::Scan, FactSelector::SysExecutable, FactSelector::Strftime, FactSelector::DynamicLoad];
+                r.facts =
+                    vec![FactSelector::Scan, FactSelector::SysExecutable, FactSelector::Strftime, FactSelector::DynamicLoad];
             }),
         );
         assert_eq!(places(&facts), [("x.py", 2), ("x.py", 3), ("x.py", 4), ("x.py", 5)]);
@@ -507,7 +594,12 @@ mod tests {
         let owner = "import os\ndef atomic_write(path, data):\n    tmp = path + '.tmp'\n    write(tmp, data)\n    os.replace(tmp, path)\n";
         let copy = "import os\nclass Saver:\n    def persist(self, path, data):\n        # same body, new name\n        tmp = path + '.tmp'\n        write(tmp, data)\n        os.replace(tmp, path)\n";
         let redefinition = "def atomic_write(path, data):\n    return None\n";
-        let files = [("fleetd/pk.py", owner), ("land/copy.py", copy), ("land/redef.py", redefinition), ("land/ok.py", "def other():\n    return 1\n")];
+        let files = [
+            ("fleetd/pk.py", owner),
+            ("land/copy.py", copy),
+            ("land/redef.py", redefinition),
+            ("land/ok.py", "def other():\n    return 1\n"),
+        ];
         let make = |r: &mut Rule| {
             r.owners = vec!["fleetd/pk.py".into()];
             r.functions = vec!["atomic_write".into()];
@@ -536,5 +628,62 @@ mod tests {
         collect_keys(&json, "", &mut keys);
         let got: Vec<&str> = keys.iter().map(String::as_str).collect();
         assert_eq!(got, ["a", "a.b", "a.b.c", "list", "list.k1", "list.k2", "top", "top.deep", "x.y"]);
+    }
+
+    /// Relative spellings, deeper submodules and names reached through a
+    /// relative import cannot slip past a forbidden-import rule.
+    #[test]
+    fn tooth_forbidden_imports_see_relative_and_deeper_spellings() {
+        let files = [
+            ("land/__init__.py", ""),
+            ("land/stopfacts/__init__.py", ""),
+            ("land/stopfacts/sub.py", "def read():\n    return 1\n"),
+            ("land/a.py", "from . import stopfacts\n"),
+            ("land/b.py", "from .stopfacts import sub\nsub.read()\n"),
+            ("land/deep/__init__.py", ""),
+            ("land/deep/c.py", "from ..stopfacts.sub import read\nread()\n"),
+            ("fleetd/d.py", "import land.stopfacts.sub\n"),
+            ("fleetd/ok.py", "import land.other\nfrom . import stopfacts_like\n"),
+        ];
+        let imports = run(
+            &files,
+            rule(RuleKind::ForbiddenSymbolOrCall, |r| {
+                r.imports = vec!["land.stopfacts".into()];
+                r.exclude = vec!["land/stopfacts/*".into()];
+            }),
+        );
+        assert_eq!(places(&imports), [("fleetd/d.py", 1), ("land/a.py", 1), ("land/b.py", 1), ("land/deep/c.py", 1)]);
+
+        let calls = run(
+            &files,
+            rule(RuleKind::ForbiddenSymbolOrCall, |r| {
+                r.symbols = vec!["land.stopfacts.sub.read".into()];
+                r.calls_only = true;
+            }),
+        );
+        assert_eq!(places(&calls), [("land/b.py", 2), ("land/deep/c.py", 2)]);
+        assert!(calls.findings[0].message.contains("call of land.stopfacts.sub.read"));
+    }
+
+    #[test]
+    fn flock_flags_in_a_variable_are_reported_as_unknown_not_as_blocking() {
+        let source = "import fcntl\ndef lock(fd, flags):\n    fcntl.flock(fd, flags)\n";
+        let verdict = run(&[("land/x.py", source)], Rule::new("r", RuleKind::FlockBounded));
+        assert_eq!(places(&verdict), [("land/x.py", 3)]);
+        assert!(verdict.findings[0].message.contains("flags are not visible"), "{}", verdict.findings[0].message);
+    }
+
+    #[test]
+    fn rules_see_python_without_a_py_suffix() {
+        let all = AllFacts::from_entries(&[
+            ("bin/tool", 0o100755, "#!/usr/bin/env python3\nimport os\ndef save(a, b):\n    os.replace(a, b)\n"),
+            ("bin/notes", 0o100644, "os.replace is mentioned here\n"),
+        ]);
+        let pack = RulePack {
+            rule: vec![rule(RuleKind::AtomicReplaceOwner, |r| r.owners = vec!["fleetd/pk.py".into()])],
+            ..RulePack::default()
+        };
+        let verdict = reduce(&all, &pack, &Catalogs::default(), None).remove(0);
+        assert_eq!(places(&verdict), [("bin/tool", 4)]);
     }
 }

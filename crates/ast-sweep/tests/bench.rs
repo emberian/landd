@@ -10,10 +10,10 @@ use std::path::Path;
 fn show(label: &str, report: &SweepReport) {
     let stats = &report.stats;
     eprintln!(
-        "bench in-process {label}: list {:.1} map {:.1} (load {:.1} parse {:.1}) catalogs {:.1} graph {:.1} reduce {:.1} cones {:.1} total {:.1} ms | {} parsed, {} re-read singly, {} blobs from memory, {}/{} packs hit ({} from memory) | {} findings, {} cones",
+        "bench in-process {label}: list {:.1} map {:.1} (load {:.1} parse {:.1}) catalogs {:.1} graph {:.1} reduce {:.1} cones {:.1} total {:.1} ms | {} parsed, {} re-read singly, {} blobs from memory, {}/{} packs hit ({} from memory) | {} findings, {} cones ({} widened)",
         stats.list_ms, stats.map_ms, stats.load_ms, stats.parse_ms, report.catalogs_ms, report.graph_ms, report.reduce_ms, report.cones_ms, report.total_ms,
         stats.blobs_parsed, stats.blobs_from_cache, stats.blobs_from_memory, stats.packs_hit, stats.packs, stats.packs_from_memory,
-        report.findings, report.cones.len(),
+        report.findings, report.cones.len(), report.widened_cones,
     );
 }
 
@@ -30,7 +30,7 @@ fn bench_in_process_sweeps() {
     };
     let repo = GitRepo::open(Path::new(&path)).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let cache = BlobFactsCache::open(dir.path().join("cache"));
+    let cache = BlobFactsCache::open(dir.path().join("cache")).unwrap();
     let sweep = |rev: &str, cache: &BlobFactsCache| run_sweep(Source::Git { repo: &repo, rev }, &pack, Some(cache)).unwrap().0;
 
     if let Ok(previous) = std::env::var("LANDD_BENCH_PREV") {
@@ -44,7 +44,7 @@ fn bench_in_process_sweeps() {
     let again = sweep(&rev, &cache);
     show("same tree again, memory tier", &again);
     assert_eq!((again.stats.blobs_parsed, again.stats.packs_from_memory), (0, again.stats.packs));
-    let from_disk = sweep(&rev, &BlobFactsCache::open(dir.path().join("cache")));
+    let from_disk = sweep(&rev, &BlobFactsCache::open(dir.path().join("cache")).unwrap());
     show("same tree, fresh handle (disk)", &from_disk);
     assert_eq!((from_disk.stats.blobs_parsed, from_disk.stats.packs_from_memory), (0, 0));
     assert_eq!(serde_json::to_value(&again.verdicts).unwrap(), serde_json::to_value(&from_disk.verdicts).unwrap());

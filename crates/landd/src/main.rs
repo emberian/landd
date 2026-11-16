@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use landd_core::custody::TrustedKeys;
 use landd_core::git::GitRepo;
 use landd_sim::{ModuleCosts, SimConfig};
-use landd_train::{Candidate, CandidateOutcome};
+use landd_train::{valid_lane, Candidate, CandidateOutcome};
 use serde_json::json;
 use station::{default_cache_dir, load_config, load_pack, AnyError, Station};
 use std::collections::BTreeMap;
@@ -58,7 +58,7 @@ enum Command {
         worktree: bool,
         #[arg(long)]
         rules: Option<PathBuf>,
-        /// A gateaudits.json whose guards become cone reads.
+        /// A trusted gateaudits.json: its guards, domains and loader declarations join the pack.
         #[arg(long)]
         gateaudits: Option<PathBuf>,
         #[arg(long)]
@@ -88,6 +88,10 @@ enum Command {
         json: bool,
     },
     /// Judge one lane against the target ref; push it with --apply.
+    ///
+    /// Exit 0: landed, would land (dry run), or nothing to change. Exit 1:
+    /// declined, refused, deferred, carried by another push, or a lane with
+    /// nothing to land.
     Land {
         #[arg(long)]
         repo: PathBuf,
@@ -121,19 +125,20 @@ enum Command {
         #[command(subcommand)]
         request: CtlRequest,
     },
-    /// Replay a fleet land ledger through the batch-train model.
+    /// Report what a fleet land ledger shows, and replay it when it holds enough.
     Replay {
         #[arg(long)]
         ledger: PathBuf,
+        /// Module -> seconds, for ledgers that record module sets without costs.
         #[arg(long)]
         module_costs: Option<PathBuf>,
+        /// Fleet's timing tables (keeper walls, push counter), reported as observed.
+        #[arg(long)]
+        timings: Option<PathBuf>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long = "set", value_name = "KEY=VALUE")]
         overrides: Vec<String>,
-        /// Seconds assumed for a module the ledger never measured.
-        #[arg(long, default_value_t = 30.0)]
-        default_module_s: f64,
         #[arg(long)]
         json: bool,
     },
@@ -141,15 +146,29 @@ enum Command {
     PreReceive {
         #[arg(long)]
         trusted_keys: PathBuf,
-        #[arg(long, default_value = "refs/heads/main")]
+        /// This repository's identity, as the landing side names it: the
+        /// canonical push destination (or its `repo_id` setting).
+        #[arg(long)]
+        repo_id: String,
+        /// Refs to protect besides refs/heads/main.
+        #[arg(long)]
         protect: Vec<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum CtlRequest {
-    Enqueue { lane: String },
-    Status,
+    /// Queue a lane: its branch on the push destination, or --tip.
+    Enqueue {
+        lane: String,
+        #[arg(long)]
+        tip: Option<String>,
+    },
+    Status {
+        /// Cursor from an earlier reply's `next`.
+        #[arg(long, default_value_t = 0)]
+        since: u64,
+    },
     Shutdown,
 }
 
@@ -168,18 +187,21 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn facts_cache(cache_dir: Option<PathBuf>, no_cache: bool) -> Option<BlobFactsCache> {
+fn facts_cache(cache_dir: Option<PathBuf>, no_cache: bool) -> Result<Option<BlobFactsCache>, AnyError> {
     if no_cache {
-        return None;
+        return Ok(None);
     }
-    cache_dir.or_else(default_cache_dir).map(|dir| BlobFactsCache::open(dir.join("facts")))
+    match cache_dir.or_else(default_cache_dir) {
+        Some(dir) => Ok(Some(BlobFactsCache::open(dir.join("facts"))?)),
+        None => Ok(None),
+    }
 }
 
 fn run(command: Command) -> Result<ExitCode, AnyError> {
     match command {
         Command::Sweep { repo, rev, worktree, rules, gateaudits, cache_dir, no_cache, json } => {
             let pack = load_pack(rules.as_deref(), gateaudits.as_deref())?;
-            let cache = facts_cache(cache_dir, no_cache);
+            let cache = facts_cache(cache_dir, no_cache)?;
             let opened;
             let source = if worktree {
                 Source::Dir(&repo)
@@ -201,18 +223,50 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
                 let stats = &report.stats;
                 say!(
                     "{} files, {} with facts: {} parsed, {} from blob cache, {}/{} packs hit; {} cones",
-                    stats.files, stats.fact_files, stats.blobs_parsed, stats.blobs_from_cache, stats.packs_hit, stats.packs,
+                    stats.files,
+                    stats.fact_files,
+                    stats.blobs_parsed,
+                    stats.blobs_from_cache,
+                    stats.packs_hit,
+                    stats.packs,
                     report.cones.len()
                 );
-                if report.tainted_cones > 0 {
-                    say!("{} cones reach an undeclared dynamic loader; the widest:", report.tainted_cones);
-                    for source in report.taint_sources.iter().take(8) {
-                        say!("  {} taints {} cones", source.path, source.cones);
+                if report.widened_cones > 0 {
+                    say!(
+                        "{} of {} cones depend on the whole tree. Cones widened, by cause:",
+                        report.widened_cones,
+                        report.cones.len()
+                    );
+                    for (cause, cones) in &report.widened_by_cause {
+                        say!("  {:>6}  {}", cones, serde_json::to_value(cause)?.as_str().unwrap_or(""));
                     }
+                    say!("The files that widen the most cones:");
+                    for source in report.widening.iter().take(12) {
+                        say!(
+                            "  {:>6}  {}  ({})",
+                            source.cones,
+                            source.path,
+                            serde_json::to_value(source.cause)?.as_str().unwrap_or("")
+                        );
+                    }
+                }
+                for loader in &report.loaders {
+                    let force = if loader.in_force { "in force" } else { "not in force" };
+                    say!(
+                        "loader {}: {} ({force}): {}",
+                        loader.declared,
+                        serde_json::to_value(loader.status)?.as_str().unwrap_or(""),
+                        loader.detail
+                    );
                 }
                 say!(
                     "list {:.1} ms, map {:.1} ms, graph {:.1} ms, reduce {:.1} ms, cones {:.1} ms, total {:.1} ms",
-                    stats.list_ms, stats.map_ms, report.graph_ms, report.reduce_ms, report.cones_ms, report.total_ms
+                    stats.list_ms,
+                    stats.map_ms,
+                    report.graph_ms,
+                    report.reduce_ms,
+                    report.cones_ms,
+                    report.total_ms
                 );
             }
             Ok(ExitCode::from(u8::from(report.rules_failed > 0)))
@@ -222,9 +276,9 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             let mut pack = load_pack(rules.as_deref(), gateaudits.as_deref())?;
             pack.rule.retain(|rule| rule.kind == ast_sweep::RuleKind::PythonImportGraph);
             if pack.rule.is_empty() {
-                pack.rule = ast_sweep::RulePack::builtin().rule.into_iter().filter(|r| r.kind == ast_sweep::RuleKind::PythonImportGraph).collect();
+                pack.rule.push(ast_sweep::Rule::new("python-import-graph", ast_sweep::RuleKind::PythonImportGraph));
             }
-            let cache = facts_cache(cache_dir, no_cache);
+            let cache = facts_cache(cache_dir, no_cache)?;
             let repo = GitRepo::open(&repo)?;
             let (base_report, base_all) = ast_sweep::run_sweep(Source::Git { repo: &repo, rev: &base }, &pack, cache.as_ref())?;
             let (head_report, head_all) = ast_sweep::run_sweep(Source::Git { repo: &repo, rev: &head }, &pack, cache.as_ref())?;
@@ -235,7 +289,8 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
                     Some(old) if old.digest == cone.digest => transported += 1,
                     Some(old) => {
                         let moved = old.to_cone(&base_all).moved_paths(&cone.to_cone(&head_all));
-                        changed.push(json!({"unit": cone.unit, "path": cone.path, "dynamic_loads": cone.dynamic_loads, "moved_paths": moved}));
+                        changed
+                            .push(json!({"unit": cone.unit, "path": cone.path, "widened": cone.widened, "moved_paths": moved}));
                     }
                     None => added.push(cone.unit.clone()),
                 }
@@ -245,24 +300,40 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             let report = json!({
                 "base": base_report.tree, "head": head_report.tree,
                 "units": head_report.cones.len(), "transported": transported,
+                "widened": head_report.widened_cones, "widened_by_cause": head_report.widened_by_cause,
                 "changed": changed, "added": added, "removed": removed,
                 "ms": started.elapsed().as_secs_f64() * 1000.0,
             });
             if json {
                 print_json(&report)?;
             } else {
-                say!("{} units: {} transported (0 runs), {} changed, {} added, {} removed", head_report.cones.len(), transported, changed.len(), added.len(), removed.len());
+                say!(
+                    "{} units: {} transported (0 runs), {} changed, {} added, {} removed; {} depend on the whole tree",
+                    head_report.cones.len(),
+                    transported,
+                    changed.len(),
+                    added.len(),
+                    removed.len(),
+                    head_report.widened_cones
+                );
                 for unit in &changed {
-                    let moved: Vec<&str> = unit["moved_paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
+                    let moved: Vec<&str> =
+                        unit["moved_paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
                     say!("  changed {} <- {}", unit["unit"].as_str().unwrap_or(""), moved.join(", "));
                 }
                 for unit in &added {
                     say!("  added   {unit}");
                 }
+                for unit in &removed {
+                    say!("  removed {unit}");
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
         Command::Land { repo, lane, target, apply, config, overrides } => {
+            if !valid_lane(&lane) {
+                return Err(format!("{lane:?} is not a lane name (a branch name or a commit id)").into());
+            }
             let mut config = load_config(config.as_deref(), &overrides)?;
             if let Some(target) = target {
                 config = config.with_override(&format!("target_ref={target}"))?;
@@ -271,36 +342,45 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             let candidate = Candidate { tip: station.repo.commit_of(&lane)?, lane };
             let report = station.train()?.land_batch(&[candidate], apply, daemon::unix_now())?;
             print_json(&report)?;
-            let settled = report.outcomes.iter().all(|(_, outcome)| {
-                matches!(outcome, CandidateOutcome::Landed { .. } | CandidateOutcome::AlreadyLanded { .. } | CandidateOutcome::WouldLand { .. })
+            let done = report.outcomes.iter().all(|(_, outcome)| {
+                matches!(
+                    outcome,
+                    CandidateOutcome::Landed { .. } | CandidateOutcome::WouldLand { .. } | CandidateOutcome::NoChange
+                )
             });
-            Ok(ExitCode::from(u8::from(!settled)))
+            Ok(ExitCode::from(u8::from(!done)))
         }
         Command::Daemon { socket, config, repo, overrides } => {
+            // Everything that can be wrong with the configuration (sandbox,
+            // key, state directory) is an error here, before the socket exists.
             let station = Station::open(&repo, load_config(Some(&config), &overrides)?)?;
-            // Fail now, not on the first batch, if the signer cannot be built.
             station.train()?;
             daemon::serve(&socket, &station)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Ctl { socket, request } => {
             let request = match request {
-                CtlRequest::Enqueue { lane } => wire::Request::Enqueue { lane },
-                CtlRequest::Status => wire::Request::Status {},
+                CtlRequest::Enqueue { lane, tip } => wire::Request::Enqueue { lane, tip },
+                CtlRequest::Status { since } => wire::Request::Status { since },
                 CtlRequest::Shutdown => wire::Request::Shutdown {},
             };
             let response = daemon::call(&socket, &request)?;
             print_json(&response)?;
             Ok(ExitCode::from(u8::from(matches!(response, wire::Response::Error { .. }))))
         }
-        Command::Replay { ledger, module_costs, config, overrides, default_module_s, json } => {
+        Command::Replay { ledger, module_costs, timings, config, overrides, json } => {
             let config = load_config(config.as_deref(), &overrides)?;
-            let ledger = landd_sim::parse_ledger(&std::fs::read_to_string(&ledger)?);
-            let mut costs = ModuleCosts::observe(&ledger, default_module_s);
+            // Bytes, not text: one bad byte in a long ledger is one bad line.
+            let ledger = landd_sim::parse_ledger(&std::fs::read(&ledger)?);
+            let mut costs = ModuleCosts::observe(&ledger);
             if let Some(path) = module_costs {
                 costs = costs.with_table(&std::fs::read_to_string(path)?)?;
             }
-            let report = landd_sim::simulate(&ledger, &costs, &SimConfig::from_config(&config));
+            let timings = match timings {
+                Some(path) => Some(landd_sim::Timings::parse(&std::fs::read(path)?)?),
+                None => None,
+            };
+            let report = landd_sim::simulate(&ledger, &costs, timings, &SimConfig::from_config(&config));
             if json {
                 print_json(&report)?;
             } else {
@@ -308,20 +388,25 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::PreReceive { trusted_keys, protect } => pre_receive(&trusted_keys, &protect),
+        Command::PreReceive { trusted_keys, repo_id, protect } => pre_receive(&trusted_keys, &repo_id, protect),
     }
 }
 
-fn pre_receive(trusted_keys: &Path, protect: &[String]) -> Result<ExitCode, AnyError> {
+fn pre_receive(trusted_keys: &Path, repo_id: &str, mut protect: Vec<String>) -> Result<ExitCode, AnyError> {
+    // Naming more refs to protect never unprotects main.
+    if !protect.iter().any(|name| name == "refs/heads/main") {
+        protect.push("refs/heads/main".to_owned());
+    }
     let trusted = TrustedKeys::load(trusted_keys)?;
     let mut stdin = String::new();
     std::io::stdin().read_to_string(&mut stdin)?;
     let updates = hook::parse_updates(&stdin)?;
     let count: usize = std::env::var("GIT_PUSH_OPTION_COUNT").ok().and_then(|c| c.parse().ok()).unwrap_or(0);
     let options: Vec<String> = (0..count).filter_map(|i| std::env::var(format!("GIT_PUSH_OPTION_{i}")).ok()).collect();
-    // The hook runs inside the receiving repository, with the pushed objects in quarantine.
-    let repo = GitRepo::open(".")?;
-    match hook::check(&updates, &options, &trusted, protect, |old, new| repo.is_ancestor(old, new).unwrap_or(false)) {
+    // The hook runs inside the receiving repository, with the pushed objects
+    // in quarantine; only the variables that say so are kept.
+    let repo = GitRepo::open_in_hook()?;
+    match hook::check(repo_id, &updates, &options, &trusted, &protect, |old, new| repo.is_ancestor(old, new).unwrap_or(false)) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(why) => {
             eprintln!("landd pre-receive: {why}");

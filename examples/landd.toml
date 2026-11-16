@@ -1,21 +1,54 @@
 # Every limit is a setting. Each key can also be given as `--set key=value`.
+# These are the defaults.
 
 max_batch_size = 8
 batch_coalesce_ms = 250      # a queue of one never waits
 test_timeout_s = 600
 max_reruns_on_flake = 1
 runner_concurrency = 4
-cache_dir = ".landd-cache"   # facts/, verdicts/, deliveries/, runs/
 custody_mode = "off"         # off | ed25519 | sshsig-ed25519 | hmac-sha256
 ast_sweep_enabled = true
+
+# Trusted state (facts, verdicts, deliveries, the daemon queue). It must be an
+# absolute path outside the repository. Unset, it is $XDG_STATE_HOME/landd or
+# $HOME/.local/state/landd.
+# cache_dir = "/var/lib/landd"
 
 remote = "origin"
 target_ref = "refs/heads/main"
 cone_source = "python"       # python | manifest
-test_command = ["python3", "-m", "pytest", "-q", "{path}"]
+test_command = ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "{path}"]
 env_allow = ["PATH", "LANG", "LC_ALL", "TZ"]
+unit_manifest = "landd-units.json"
 committer_name = "landd"
 committer_email = "landd@localhost"
 max_refusals = 5
 refusal_backoff_s = 5
 seat = "landd"
+
+# Units run in a bwrap sandbox that shows them read-only system directories,
+# their own view of the tree and a private scratch directory, and nothing
+# else. "none" runs them as plain child processes: for trusted code only,
+# and receipts cannot be signed in that mode.
+isolation = "bwrap"          # bwrap | none
+unit_view = "cone"           # cone: a unit sees only its cone's files | tree
+sandbox_ro = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc"]
+sandbox_network = false
+profile_commands = []        # e.g. [["python3", "-VV"]]: part of every verdict's identity
+# Verdicts are recorded for one runtime image (what sandbox_ro shows). landd
+# hashes the test program and the profile commands' output, not every library
+# under /usr: change this id whenever the image changes.
+runtime_id = ""
+
+allow_unit_removal = false   # a candidate may delete check units
+inherit_coarse_failures = false
+push_no_verify = true
+network_timeout_s = 120
+max_blob_bytes = 67108864
+
+# Daemon.
+max_connections = 32
+request_timeout_s = 10
+settled_history = 256
+
+[push_env]

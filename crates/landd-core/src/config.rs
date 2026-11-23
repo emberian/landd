@@ -92,6 +92,7 @@ pub struct LandConfig {
     pub refusal_backoff_s: u64,
     pub seat: String,
     pub custody_key: Option<PathBuf>,
+    pub obb_grants: BTreeMap<String, crate::cone_receipt::ObbGrant>,
 
     pub isolation: Isolation,
     pub unit_view: UnitView,
@@ -158,6 +159,7 @@ impl Default for LandConfig {
             refusal_backoff_s: 5,
             seat: "landd".into(),
             custody_key: None,
+            obb_grants: BTreeMap::new(),
             isolation: Isolation::Bwrap,
             unit_view: UnitView::Cone,
             sandbox_ro: ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc"].map(String::from).to_vec(),

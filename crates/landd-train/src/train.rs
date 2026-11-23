@@ -254,6 +254,15 @@ impl<'a> Train<'a> {
         (hash(&gate), hash(profile))
     }
 
+    /// Local gate and runtime fingerprints for an operator's OBB equivalence grant.
+    pub fn unit_policy(&self, tip: Oid, base: Oid, unit: &str) -> Result<(Digest32, Digest32), TrainError> {
+        let units = self.cones_at(&tip, &base).map_err(TrainError::Cones)?;
+        if !units.cones.contains_key(unit) {
+            return Err(TrainError::Cones(format!("unknown unit {unit}")));
+        }
+        Ok(self.receipt_ids(unit, &units))
+    }
+
     /// Execute the candidate gate on its declared view and export its exact inputs.
     pub fn judge_cone(&self, tip: Oid, base: Oid, unit: &str) -> Result<ConeReceipt, TrainError> {
         let units = self.cones_at(&tip, &base).map_err(TrainError::Cones)?;

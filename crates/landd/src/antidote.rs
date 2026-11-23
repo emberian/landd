@@ -46,7 +46,7 @@ pub fn pod(database: &Path, lead: &str, principal: &str, stream: bool) -> Result
 
 /// An authenticated OBB sidecar binds the upstream evidence digest and the
 /// landd gate/runner equivalence. changed_paths is never a dependency cone.
-pub fn receipt(bytes: &[u8]) -> Result<landd_core::cone_receipt::ConeReceipt, AnyError> {
+pub fn receipt(bytes: &[u8], station: &Station) -> Result<landd_core::cone_receipt::ConeReceipt, AnyError> {
     use landd_core::{cone_receipt::ConeReceipt, Digest32, Oid};
     #[derive(serde::Deserialize)]
     struct Judge {
@@ -63,6 +63,10 @@ pub fn receipt(bytes: &[u8]) -> Result<landd_core::cone_receipt::ConeReceipt, An
     enum Evidence {
         Obb { judge_receipt_json: String, judge_file_sha256: Digest32, obb_gate_sha256: Digest32, cone_attestation: ConeReceipt },
         Native(ConeReceipt),
+    }
+    if serde_json::from_slice::<serde_json::Value>(bytes)?.get("receipt_version").is_some() {
+        let key = std::fs::read(station.state.join("obb-receipt.key"))?;
+        return landd_core::cone_receipt::native_obb(&station.repo, bytes, &key, &station.config.obb_grants);
     }
     match serde_json::from_slice(bytes)? {
         Evidence::Native(r) => Ok(r),

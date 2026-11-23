@@ -26,3 +26,12 @@ tikv-jemallocator.workspace = true
 [dev-dependencies]
 landd-core = { workspace = true, features = ["testkit"] }
 tempfile.workspace = true
+
+[dependencies.axum]
+version = "0.8"
+default-features = false
+features = ["http1", "tokio", "json"]
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "net"]

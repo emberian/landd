@@ -34,3 +34,33 @@ The workspace contains `landd-core`, `ast-sweep`, `landd-train`, `landd-sim`, an
 ## License
 
 Licensed under either the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+### Importing an OBB v8 receipt
+
+A station can use an authenticated `cone-unit@1` verdict during speculative composition.
+Install the issuer's raw HMAC key bytes in `<cache_dir>/obb-receipt.key` as a private
+operator file. Approve the OBB gate and runtime as equivalent to a particular local
+unit and runner. Obtain the local fingerprints without running the unit:
+
+```sh
+landd unit-policy --repo "$repo" --config "$config" --rev main --unit quality
+```
+
+In the station configuration, add `[obb_grants.quality]` with the four hex digests
+`gate_sha256`, `toolchain_sha256`, `local_gate_sha256` and `local_toolchain_sha256`.
+The first pair identifies the approved issuer gate and runtime. The second pair
+comes from the local policy. Pin these when deploying the station.
+
+Pass the original OBB JSON directly with `landd train-step --repo "$repo"
+--config "$config" --receipt quality.json candidate`. The train authenticates the
+pass, checks the original blobs, then compares the complete candidate path, mode
+and Git ID map. A changed runner or cone requires fresh local evidence.
+
+### Serving fenced pod operations
+
+`landd pod-service --database pods.db --lead lead --principal ci
+--listen 127.0.0.1:0 --credential-sha256 "$digest"` prints its bound address.
+Provision a dedicated keygate service row and credential for this principal.
+POSTs to `/pod/claim` and `/pod/done` authenticate with that bearer credential
+and use the same transactional ledger as `pod-step`. Fencing tokens travel as
+decimal strings to preserve all 64 bits in JavaScript.

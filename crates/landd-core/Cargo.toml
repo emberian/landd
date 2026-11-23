@@ -26,3 +26,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[dependencies.rusqlite]
+version = "0.37"
+features = ["bundled"]

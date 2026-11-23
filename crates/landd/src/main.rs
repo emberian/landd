@@ -1,6 +1,7 @@
 //! `landd`: sweep a tree, show cones, land a lane, run the daemon, replay a
 //! ledger, or guard a forge.
 
+mod antidote;
 mod daemon;
 mod hook;
 mod station;
@@ -47,6 +48,48 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run one unit and emit its content-addressed receipt.
+    JudgeCone {
+        #[command(flatten)]
+        station: antidote::Setup,
+        #[arg(long)]
+        rev: String,
+        #[arg(long)]
+        unit: String,
+    },
+    /// Compare an authenticated receipt on stdin against a commit and the configured runner.
+    #[command(visible_alias = "verify-envelope")]
+    VerifyConeReceipt {
+        #[command(flatten)]
+        station: antidote::Setup,
+        #[arg(long)]
+        tree: landd_core::Oid,
+        #[arg(long)]
+        trusted_sha256: landd_core::Digest32,
+    },
+    /// Compose and judge an ordered batch with receipts supplied by the operator.
+    TrainStep {
+        #[command(flatten)]
+        station: antidote::Setup,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long = "receipt")]
+        receipts: Vec<PathBuf>,
+        #[arg(required = true)]
+        lanes: Vec<String>,
+    },
+    /// Apply a JSON task operation with the host-authenticated principal.
+    PodStep {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        lead: String,
+        #[arg(long)]
+        principal: String,
+        #[arg(long)]
+        stream: bool,
+    },
+
     /// Check a tree against a rule pack (exit 1 when a rule fails).
     Sweep {
         #[arg(long)]
@@ -199,6 +242,48 @@ fn facts_cache(cache_dir: Option<PathBuf>, no_cache: bool) -> Result<Option<Blob
 
 fn run(command: Command) -> Result<ExitCode, AnyError> {
     match command {
+        Command::JudgeCone { station, rev, unit } => {
+            let station = station.open()?;
+            let train = station.train()?;
+            print_json(&train.judge_cone(station.repo.commit_of(&rev)?, train.forge_head()?, &unit)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::VerifyConeReceipt { station, tree, trusted_sha256 } => {
+            let station = station.open()?;
+            let train = station.train()?;
+            use sha2::{Digest, Sha256};
+            let mut bytes = Vec::new();
+            std::io::stdin().lock().read_to_end(&mut bytes)?;
+            if Sha256::digest(&bytes)[..] != trusted_sha256.as_bytes()[..] {
+                return Err("receipt differs from authenticated digest".into());
+            }
+            let r = antidote::receipt(&bytes)?;
+            if station.repo.tree_of(&tree.to_hex())? != tree {
+                return Err("expected a tree object".into());
+            }
+            let source = train.verify_cone(r, tree, train.forge_head()?)?;
+            print_json(&json!({"ok": source.is_some(), "source": source}))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::TrainStep { station, apply, receipts, lanes } => {
+            let station = station.open()?;
+            let mut train = station.train()?;
+            for path in receipts {
+                if let Some(bound) = antidote::receipt(&std::fs::read(path)?)?.bind(&station.repo)? {
+                    train.receipts.push(bound);
+                }
+            }
+            let mut batch = Vec::new();
+            for lane in lanes {
+                if !valid_lane(&lane) {
+                    return Err("invalid lane".into());
+                }
+                batch.push(Candidate { tip: station.repo.commit_of(&lane)?, lane });
+            }
+            print_json(&train.land_batch(&batch, apply, daemon::unix_now())?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::PodStep { database, lead, principal, stream } => antidote::pod(&database, &lead, &principal, stream),
         Command::Sweep { repo, rev, worktree, rules, gateaudits, cache_dir, no_cache, json } => {
             let pack = load_pack(rules.as_deref(), gateaudits.as_deref())?;
             let cache = facts_cache(cache_dir, no_cache)?;

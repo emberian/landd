@@ -479,6 +479,32 @@ impl GitRepo {
         Ok(entries)
     }
 
+    /// Resolve just the attested paths, including modes. Bound argv bytes per batch.
+    pub fn tree_inputs(
+        &self,
+        tree: Oid,
+        paths: &[&str],
+    ) -> Result<std::collections::BTreeMap<String, crate::reasons::Input>, GitError> {
+        let mut out = std::collections::BTreeMap::new();
+        let hex = tree.to_hex();
+        for chunk in paths.chunks(64) {
+            let mut args = vec!["--literal-pathspecs", "ls-tree", "--full-tree", "-z", &hex, "--"];
+            for &path in chunk {
+                if path.len() > 4096 || path.split('/').any(|p| matches!(p, "" | "." | "..")) || path.contains('\0') {
+                    return Err(GitError::Parse("invalid cone path".into()));
+                }
+                args.push(path);
+            }
+            for record in self.run_ok(&args)?.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+                let entry = parse_tree_record(record)?;
+                if matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
+                    out.insert(entry.path, crate::reasons::Input { mode: entry.mode, oid: entry.oid });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Lease a persistent `cat-file --batch` stream.
     pub fn blob_reader(&self) -> Result<BlobReader<'_>, GitError> {
         let pooled = self.readers.lock().expect("reader pool").pop();

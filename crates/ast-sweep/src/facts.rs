@@ -25,6 +25,7 @@ pub fn facts_version() -> &'static str {
                 &(language.abi_version() as u64).to_le_bytes(),
                 &(language.node_kind_count() as u64).to_le_bytes(),
                 include_bytes!("extract.rs"),
+                include_bytes!("modules.rs"),
                 include_bytes!("facts.rs"),
                 include_bytes!("reduce.rs"),
             ],
@@ -37,6 +38,10 @@ pub fn facts_version() -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileKind {
     Python,
+    TypeScript,
+    Tsx,
+    Rust,
+    Lean,
     /// Makefiles, justfiles, shell scripts and CI YAML: scanned by line.
     Recipe,
     /// An executable or extensionless file: Python or a recipe when its
@@ -62,6 +67,13 @@ impl FileKind {
         if name.ends_with(".py") {
             return Some(Self::Python);
         }
+        match name.rsplit_once('.').map(|(_, ext)| ext) {
+            Some("ts" | "js" | "mts" | "mjs") => return Some(Self::TypeScript),
+            Some("tsx") => return Some(Self::Tsx),
+            Some("rs") => return Some(Self::Rust),
+            Some("lean") => return Some(Self::Lean),
+            _ => {}
+        }
         let recipe_name = matches!(name, "Makefile" | "makefile" | "GNUmakefile" | "justfile" | "Justfile" | "Procfile")
             || name.starts_with("Dockerfile");
         let recipe_ext = [".mk", ".sh", ".bash", ".yml", ".yaml", ".just"].iter().any(|ext| name.ends_with(ext));
@@ -74,6 +86,10 @@ impl FileKind {
     pub fn slug(self) -> &'static str {
         match self {
             Self::Python => "py",
+            Self::TypeScript => "ts",
+            Self::Tsx => "tsx",
+            Self::Lean => "lean",
+            Self::Rust => "rs",
             Self::Recipe => "recipe",
             Self::Sniff => "sniff",
             Self::Link => "link",
@@ -273,6 +289,7 @@ pub struct SymbolRef {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFacts {
+    pub module_paths: Vec<String>,
     pub language: Language,
     /// The parser reported a syntax error, or the bytes are not UTF-8;
     /// facts cover what did parse.

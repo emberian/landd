@@ -3,6 +3,7 @@
 use crate::compose::{compose, Candidate, Committer, Composition, Dropped};
 use crate::cones::{ConeSource, UnitCones};
 use crate::runner::{Runner, RunnerError};
+use landd_core::cone_receipt::{BoundReceipt, ConeReceipt, VerdictSource};
 use landd_core::custody::{self, CustodyEnvelopeV2, CustodyError, SigningKey};
 use landd_core::delivery::{
     AncestryEvidence, Binding, DeclineEvidence, DeliveryError, DeliveryJournal, DeliveryState, JournalError,
@@ -14,6 +15,7 @@ use landd_core::reasons::{
 };
 use landd_core::{Digest32, Isolation, LandConfig, Oid, UnitView};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -97,6 +99,7 @@ impl CandidateOutcome {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Tally {
+    pub external_receipts: std::collections::BTreeMap<String, VerdictSource>,
     /// Compositions judged, including those of the bisection.
     pub evaluations: usize,
     pub candidate_units_run: usize,
@@ -174,6 +177,7 @@ pub struct Train<'a> {
     pub repo_id: String,
     /// `(key_id, key)` for sealing land receipts.
     signer: Option<(String, SigningKey)>,
+    pub receipts: Vec<BoundReceipt>,
     session: MemoryStore,
     memo: Mutex<HashMap<(Oid, Oid), Arc<UnitCones>>>,
 }
@@ -199,6 +203,7 @@ impl<'a> Train<'a> {
             destination,
             repo_id,
             signer: None,
+            receipts: Vec::new(),
             session: MemoryStore::new(),
             memo: Mutex::new(HashMap::new()),
         })
@@ -240,6 +245,39 @@ impl<'a> Train<'a> {
         let cones = Arc::new(cones);
         self.memo.lock().expect("cone memo").insert((*commit, *base), cones.clone());
         Ok(cones)
+    }
+
+    fn receipt_ids(&self, unit: &str, units: &UnitCones) -> (Digest32, Digest32) {
+        let profile = &self.runner.profile().description;
+        let gate = serde_json::json!([unit, units.paths.get(unit), profile["argv"], profile["program"]]);
+        let hash = |v| Digest32::from_bytes(Sha256::digest(landd_core::canonical_json(v).expect("JSON value")).into());
+        (hash(&gate), hash(profile))
+    }
+
+    /// Execute the candidate gate on its declared view and export its exact inputs.
+    pub fn judge_cone(&self, tip: Oid, base: Oid, unit: &str) -> Result<ConeReceipt, TrainError> {
+        let units = self.cones_at(&tip, &base).map_err(TrainError::Cones)?;
+        let cone = units.cones.get(unit).ok_or_else(|| TrainError::Cones(format!("unknown unit {unit}")))?;
+        let tree_oid = self.repo.tree_of(&tip.to_hex())?;
+        let run = self.runner.run_units(self.repo, &tree_oid, &[units.job(unit)])?.remove(0);
+        let (gate_sha256, toolchain_sha256) = self.receipt_ids(unit, &units);
+        Ok(ConeReceipt {
+            judge_name: unit.to_owned(),
+            gate_sha256,
+            toolchain_sha256,
+            tree_oid,
+            all_passed: run.is_durable() && run.status() == Status::Pass,
+            clean_working_tree: true,
+            cone_blobs: cone.inputs.iter().map(|(p, i)| (p.clone(), i.oid)).collect(),
+        })
+    }
+
+    pub fn verify_cone(&self, r: ConeReceipt, tip: Oid, base: Oid) -> Result<Option<VerdictSource>, TrainError> {
+        let Some(bound) = r.bind(self.repo)? else { return Ok(None) };
+        let units = self.cones_at(&tip, &base).map_err(TrainError::Cones)?;
+        let Some(cone) = units.cones.get(bound.unit()) else { return Ok(None) };
+        let (gate, tools) = self.receipt_ids(bound.unit(), &units);
+        Ok(bound.transport(gate, tools, &cone.inputs))
     }
 
     fn binding(&self, base: &Oid, lane_tip: &Oid, merged_head: Oid) -> Binding {
@@ -592,6 +630,19 @@ impl<'a> Train<'a> {
             }
         };
         let overlay = Overlay { durable: self.store, session: &self.session };
+        for receipt in &self.receipts {
+            let unit = receipt.unit();
+            let Some(cone) = cand_units.cones.get(unit) else { continue };
+            let digest = cone.digest();
+            if overlay.get(unit, &digest)?.is_some() {
+                continue;
+            }
+            let (gate, tools) = self.receipt_ids(unit, &cand_units);
+            if let Some(source) = receipt.transport(gate, tools, &cone.inputs) {
+                self.session.put(&Observation { unit_id: unit.to_owned(), cone_digest: digest, status: Status::Pass })?;
+                tally.external_receipts.insert(unit.to_owned(), source);
+            }
+        }
         let policy =
             JudgePolicy { allow_removed: self.config.allow_unit_removal, inherit_coarse: self.config.inherit_coarse_failures };
         let mut reasons = judge(&base_units.cones, &cand_units.cones, &overlay, &policy)?;

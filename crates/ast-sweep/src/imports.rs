@@ -369,7 +369,7 @@ fn join(base: &str, tail: &str) -> String {
 
 /// `target` as written in a link that sits in `dir`; `None` when it is
 /// absolute or climbs out of the tree.
-fn link_destination(dir: &str, target: &str) -> Option<String> {
+pub(crate) fn link_destination(dir: &str, target: &str) -> Option<String> {
     if target.starts_with('/') {
         return None;
     }
@@ -940,6 +940,21 @@ impl ImportGraph {
             }
             return Some(out);
         }
+        if let Some(kind) = file.kind.filter(|kind| crate::modules::supported(*kind)) {
+            let facts = file.facts.as_deref()?;
+            if facts.parse_error || facts.too_large || facts.truncated {
+                out.causes.push(Cause::ParseError);
+            }
+            for name in &facts.module_paths {
+                let paths = crate::modules::resolve(kind, &file.path, name, &context.config.roots);
+                let before = out.targets.len();
+                out.targets.extend(paths.iter().filter_map(|p| context.all.index_of(p).map(|i| i as u32)));
+                if out.targets.len() == before {
+                    out.causes.push(Cause::UnresolvedLoad);
+                }
+            }
+            return Some(out);
+        }
         let facts =
             file.facts.as_deref().filter(|facts| file.kind == Some(FileKind::Python) || facts.language == Language::Python)?;
         let model = context.config.cone_model;
@@ -1284,7 +1299,11 @@ impl ImportGraph {
                 }
                 continue;
             }
-            let Some(facts) = py_facts[index] else { continue };
+            let Some(facts) = py_facts[index] else {
+                scopes.state_edges[top_s as usize].extend(self.edges[index].iter().map(|i| scopes.file_states[*i as usize].2));
+                scopes.state_causes[top_s as usize].extend(&self.causes[index]);
+                continue;
+            };
             if facts.parse_error || facts.truncated {
                 scopes.state_causes[top_s as usize].push(Cause::ParseError);
             }
@@ -1902,8 +1921,14 @@ impl ImportCone {
 /// judges the cones (rule pack, runner profile) and is part of every digest.
 pub fn cones(all: &AllFacts, graph: &ImportGraph, config: &ImportConfig, context: &Digest32) -> Vec<ImportCone> {
     let paths = all.paths();
-    let tests: Vec<u32> =
-        GlobSet::new(&config.tests).select(&paths).into_iter().filter(|i| all.files[*i as usize].is_python()).collect();
+    let tests: Vec<u32> = GlobSet::new(&config.tests)
+        .select(&paths)
+        .into_iter()
+        .filter(|i| {
+            let file = &all.files[*i as usize];
+            file.is_python() || file.kind.is_some_and(crate::modules::supported)
+        })
+        .collect();
     let leaves: Vec<[u8; 32]> =
         light_pool().install(|| all.files.par_iter().map(|f| cone_leaf(&f.path, f.mode, &f.oid)).collect());
     let everything: Vec<u32> = (0..all.files.len() as u32).collect();
@@ -1930,7 +1955,7 @@ pub fn cones(all: &AllFacts, graph: &ImportGraph, config: &ImportConfig, context
                     let unit = graph.module_of(*test).unwrap_or(path).to_owned();
                     stack.clear();
                     stack.push(graph.scopes.file_states[*test as usize].1);
-                    if config.implicit_conftest {
+                    if config.implicit_conftest && all.files[*test as usize].is_python() {
                         let mut dir = path;
                         loop {
                             dir = parent(dir);

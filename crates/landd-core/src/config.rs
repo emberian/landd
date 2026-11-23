@@ -18,7 +18,8 @@ pub enum CustodyMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConeSourceKind {
-    /// Static Python import and read cones from `ast-sweep`.
+    /// Static import and read cones from `ast-sweep`.
+    #[serde(alias = "imports")]
     Python,
     /// Units and their input globs declared in a manifest file in the tree.
     Manifest,

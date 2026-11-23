@@ -11,6 +11,7 @@ pub mod extract;
 pub mod facts;
 pub mod glob;
 pub mod imports;
+mod modules;
 pub mod reduce;
 pub mod rules;
 pub mod sweep;

@@ -1,10 +1,9 @@
 //! `landd`: sweep a tree, show cones, land a lane, run the daemon, replay a
 //! ledger, or guard a forge.
 
-mod antidote;
 mod daemon;
 mod hook;
-mod pod_service;
+mod pod;
 mod station;
 mod wire;
 
@@ -50,11 +49,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Serve fenced claim and done operations for one keygate service row.
-    PodService(pod_service::Service),
+    PodService(pod::Service),
     /// Print the local grant fingerprints without running the unit.
     UnitPolicy {
         #[command(flatten)]
-        station: antidote::Setup,
+        station: station::StationArgs,
         #[arg(long)]
         rev: String,
         #[arg(long)]
@@ -63,7 +62,7 @@ enum Command {
     /// Run one unit and emit its content-addressed receipt.
     JudgeCone {
         #[command(flatten)]
-        station: antidote::Setup,
+        station: station::StationArgs,
         #[arg(long)]
         rev: String,
         #[arg(long)]
@@ -73,7 +72,7 @@ enum Command {
     #[command(visible_alias = "verify-envelope")]
     VerifyConeReceipt {
         #[command(flatten)]
-        station: antidote::Setup,
+        station: station::StationArgs,
         #[arg(long)]
         tree: landd_core::Oid,
         #[arg(long)]
@@ -82,7 +81,7 @@ enum Command {
     /// Compose and judge an ordered batch with receipts supplied by the operator.
     TrainStep {
         #[command(flatten)]
-        station: antidote::Setup,
+        station: station::StationArgs,
         #[arg(long)]
         apply: bool,
         #[arg(long = "receipt")]
@@ -276,7 +275,7 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             if Sha256::digest(&bytes)[..] != trusted_sha256.as_bytes()[..] {
                 return Err("receipt differs from authenticated digest".into());
             }
-            let r = antidote::receipt(&bytes, &station)?;
+            let r = station.cone_receipt(&bytes)?;
             if station.repo.tree_of(&tree.to_hex())? != tree {
                 return Err("expected a tree object".into());
             }
@@ -288,7 +287,7 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             let station = station.open()?;
             let mut train = station.train()?;
             for path in receipts {
-                if let Some(bound) = antidote::receipt(&std::fs::read(path)?, &station)?.bind(&station.repo)? {
+                if let Some(bound) = station.cone_receipt(&std::fs::read(path)?)?.bind(&station.repo)? {
                     train.receipts.push(bound);
                 }
             }
@@ -306,7 +305,7 @@ fn run(command: Command) -> Result<ExitCode, AnyError> {
             service.run()?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::PodStep { database, lead, principal, stream } => antidote::pod(&database, &lead, &principal, stream),
+        Command::PodStep { database, lead, principal, stream } => pod::step(&database, &lead, &principal, stream),
         Command::Sweep { repo, rev, worktree, rules, gateaudits, cache_dir, no_cache, json } => {
             let pack = load_pack(rules.as_deref(), gateaudits.as_deref())?;
             let cache = facts_cache(cache_dir, no_cache)?;

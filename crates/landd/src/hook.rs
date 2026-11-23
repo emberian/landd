@@ -1,7 +1,7 @@
 //! `landd pre-receive`: the forge-side check that a protected ref only moves
 //! forward, and only with a verified land receipt for exactly that move.
 
-use landd_core::custody::{self, CustodyEnvelopeV2, TrustedKeys};
+use landd_core::custody::{self, CustodyEnvelope, TrustedKeys};
 use landd_core::digest::hex_decode;
 use landd_core::Oid;
 
@@ -37,7 +37,7 @@ pub const MAX_PUSH_OPTIONS: usize = 64;
 pub const MAX_HOOK_STDIN_BYTES: u64 = 1 << 20;
 
 /// The receipts carried as `landd-custody=<hex>` push options.
-pub fn receipts(push_options: &[String]) -> Vec<CustodyEnvelopeV2> {
+pub fn receipts(push_options: &[String]) -> Vec<CustodyEnvelope> {
     let prefix = format!("{}=", custody::PUSH_OPTION);
     push_options
         .iter()
@@ -45,7 +45,7 @@ pub fn receipts(push_options: &[String]) -> Vec<CustodyEnvelopeV2> {
         .filter(|option| option.len() <= custody::MAX_PUSH_OPTION_BYTES)
         .filter_map(|option| option.strip_prefix(prefix.as_str()))
         .filter_map(hex_decode)
-        .filter_map(|wire| CustodyEnvelopeV2::from_wire(&wire).ok())
+        .filter_map(|wire| CustodyEnvelope::from_wire(&wire).ok())
         .collect()
 }
 
@@ -102,7 +102,7 @@ mod tests {
 
     fn option(key: &SigningKey, kind: &str, name: &str, old: u8, new: u8) -> String {
         let subject = custody::ref_update_subject(REPO, name, &oid(old), &oid(new));
-        let receipt = CustodyEnvelopeV2::seal(key, "seat", "seat", kind, subject, json!({"batch_size": 1})).unwrap();
+        let receipt = CustodyEnvelope::seal(key, "seat", "seat", kind, subject, json!({"batch_size": 1})).unwrap();
         format!("{}={}", custody::PUSH_OPTION, hex_encode(&receipt.to_wire().unwrap()))
     }
 

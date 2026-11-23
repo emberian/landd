@@ -1,4 +1,6 @@
-//! Keygate service row for one authenticated pod principal.
+//! Fenced pod operations: `pod-step` for a host that authenticates its own
+//! principals, and `pod-service`, the keygate service row for one principal.
+//! Both keep one ledger connection open for their whole life.
 use crate::station::AnyError;
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -13,8 +15,10 @@ use landd_core::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
+    io::{BufRead, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::ExitCode,
     sync::{Arc, Mutex},
 };
 
@@ -49,6 +53,35 @@ struct Done {
     pod: String,
     task: String,
     fencing_token: String,
+}
+
+/// Apply one JSON operation from stdin, or with `stream` one per line until
+/// stdin closes, as `principal`.
+pub fn step(database: &Path, lead: &str, principal: &str, stream: bool) -> Result<ExitCode, AnyError> {
+    #[derive(Deserialize)]
+    struct Request {
+        pod: String,
+        #[serde(default)]
+        task: String,
+        action: Action,
+    }
+    let mut ledger = PodLedger::open(database, lead)?;
+    let mut apply = |request: Request| -> Result<_, AnyError> {
+        Ok(ledger.apply(principal, &request.pod, &request.task, crate::daemon::unix_now().try_into()?, request.action)?)
+    };
+    if stream {
+        for line in std::io::stdin().lock().lines() {
+            let result = serde_json::from_str(&line?).map_err(Into::into).and_then(&mut apply);
+            let response = match result {
+                Ok(task) => serde_json::json!({"ok":true,"task":task}),
+                Err(e) => serde_json::json!({"ok":false,"reason":e.to_string()}),
+            };
+            writeln!(std::io::stdout().lock(), "{response}")?;
+        }
+    } else {
+        crate::print_json(&apply(serde_json::from_reader(std::io::stdin().lock())?)?)?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn apply(

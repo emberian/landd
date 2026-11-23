@@ -1,4 +1,4 @@
-//! Run with OBB_BIN pointing at the v8 binary used by the issuing station.
+//! Run with OBB_BIN pointing at the obb executable (0.8.0 or later) used by the issuing station.
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -13,8 +13,8 @@ fn check(out: Output) -> String {
 
 #[test]
 #[ignore = "cross-project acceptance requires OBB_BIN"]
-fn transport_real_obb_v2_onto_speculative_merge() {
-    let obb = std::env::var("OBB_BIN").expect("set OBB_BIN to the obb v8 executable");
+fn transport_real_obb_receipt_onto_speculative_merge() {
+    let obb = std::env::var("OBB_BIN").expect("set OBB_BIN to the obb executable");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     use std::os::unix::fs::PermissionsExt;

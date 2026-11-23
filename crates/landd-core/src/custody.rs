@@ -1,4 +1,4 @@
-//! `CustodyEnvelopeV2`: a signed, versioned, open-ended receipt.
+//! `CustodyEnvelope`: a signed, versioned, open-ended receipt (wire version 2).
 //!
 //! The signature covers
 //! `"landd-custody/v2\n" || BLAKE3(canonical_header) || BLAKE3(canonical_claims)`.
@@ -49,7 +49,7 @@ pub struct CustodyHeader {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CustodyEnvelopeV2 {
+pub struct CustodyEnvelope {
     pub header: CustodyHeader,
     /// Open-ended: any JSON object without floats.
     pub claims: serde_json::Value,
@@ -384,7 +384,7 @@ impl TrustedKeys {
     }
 }
 
-impl CustodyEnvelopeV2 {
+impl CustodyEnvelope {
     pub fn seal(
         key: &SigningKey,
         key_id: &str,
@@ -587,8 +587,8 @@ mod tests {
         trusted
     }
 
-    fn seal(key: &SigningKey, claims: serde_json::Value) -> CustodyEnvelopeV2 {
-        CustodyEnvelopeV2::seal(key, "seat-a", "seat-a", "land-receipt", Digest32::blake3(b"subject"), claims).unwrap()
+    fn seal(key: &SigningKey, claims: serde_json::Value) -> CustodyEnvelope {
+        CustodyEnvelope::seal(key, "seat-a", "seat-a", "land-receipt", Digest32::blake3(b"subject"), claims).unwrap()
     }
 
     #[test]
@@ -597,7 +597,7 @@ mod tests {
             let envelope = seal(&key, json!({"verdict": "green", "units_run": 3}));
             envelope.verify(&trust(&key)).unwrap();
             let wire = envelope.to_wire().unwrap();
-            let back = CustodyEnvelopeV2::from_wire(&wire).unwrap();
+            let back = CustodyEnvelope::from_wire(&wire).unwrap();
             assert_eq!(back, envelope);
             back.verify(&trust(&key)).unwrap();
         }
@@ -630,7 +630,7 @@ mod tests {
                 envelope.signature,
                 serde_json::to_string(&envelope.header).unwrap()
             );
-            let received: CustodyEnvelopeV2 = serde_json::from_str(&text).unwrap();
+            let received: CustodyEnvelope = serde_json::from_str(&text).unwrap();
             assert_eq!(received.signature, original_signature);
             received.verify(&trust(&key)).unwrap();
             assert_eq!(received.claims_as::<Known>().unwrap().verdict, "green");
@@ -694,7 +694,7 @@ mod tests {
         let good = seal(&key, json!({"verdict": "green"}));
         for domain in [&b"landd-custody/v1\n"[..], b"landd-custody/v2", b""] {
             let message = signing_message_with_domain(domain, &good.header, &good.claims).unwrap();
-            let forged = CustodyEnvelopeV2 {
+            let forged = CustodyEnvelope {
                 signature: hex_encode(&EdSigningKey::from_bytes(&seed).sign(&message).to_bytes()),
                 ..good.clone()
             };
@@ -731,11 +731,11 @@ mod tests {
         let key = SigningKey::ed25519_from_seed([7; 32]);
         let subject = Digest32::blake3(b"s");
         assert!(matches!(
-            CustodyEnvelopeV2::seal(&key, "k", "s", "land-receipt", subject, json!([1, 2])),
+            CustodyEnvelope::seal(&key, "k", "s", "land-receipt", subject, json!([1, 2])),
             Err(CustodyError::ClaimsNotObject)
         ));
         assert!(matches!(
-            CustodyEnvelopeV2::seal(&key, "k", "s", "land-receipt", subject, json!({"cpu": 1.5})),
+            CustodyEnvelope::seal(&key, "k", "s", "land-receipt", subject, json!({"cpu": 1.5})),
             Err(CustodyError::Canon(CanonError::Float(_)))
         ));
     }
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn tooth_a_valid_signature_outside_the_keys_grant_is_refused() {
         for key in keys() {
-            let land = CustodyEnvelopeV2::seal(&key, "k", "seat-a", "land-receipt", Digest32::blake3(b"s"), json!({})).unwrap();
+            let land = CustodyEnvelope::seal(&key, "k", "seat-a", "land-receipt", Digest32::blake3(b"s"), json!({})).unwrap();
             let mut runner_only = TrustedKeys::new();
             runner_only.insert("k", key.trusted(), Grant::new(&["seat-a"], &["runner-attestation"])).unwrap();
             assert!(matches!(land.verify(&runner_only), Err(CustodyError::NotAuthorized { .. })));
@@ -829,16 +829,16 @@ mod tests {
         let key = SigningKey::ed25519_from_seed([7; 32]);
         let envelope = seal(&key, json!({"verdict": "green", "batch_size": 4}));
         let wire = String::from_utf8(envelope.to_wire().unwrap()).unwrap();
-        assert_eq!(CustodyEnvelopeV2::from_wire(wire.as_bytes()).unwrap(), envelope);
+        assert_eq!(CustodyEnvelope::from_wire(wire.as_bytes()).unwrap(), envelope);
         // A duplicate claim key: last-wins parsers and first-wins parsers
         // would disagree about what was signed.
         let duplicated = wire.replacen("\"batch_size\":4", "\"batch_size\":9,\"batch_size\":4", 1);
         assert_ne!(duplicated, wire);
-        assert!(CustodyEnvelopeV2::from_wire(duplicated.as_bytes()).is_err());
+        assert!(CustodyEnvelope::from_wire(duplicated.as_bytes()).is_err());
         let spaced = wire.replacen(":", ": ", 1);
-        assert!(CustodyEnvelopeV2::from_wire(spaced.as_bytes()).is_err());
+        assert!(CustodyEnvelope::from_wire(spaced.as_bytes()).is_err());
         let escaped = wire.replacen("green", "gr\\u0065en", 1);
-        assert!(CustodyEnvelopeV2::from_wire(escaped.as_bytes()).is_err());
+        assert!(CustodyEnvelope::from_wire(escaped.as_bytes()).is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::compose::{compose, Candidate, Committer, Composition, Dropped};
 use crate::cones::{ConeSource, UnitCones};
 use crate::runner::{Runner, RunnerError};
 use landd_core::cone_receipt::{BoundReceipt, ConeReceipt, VerdictSource};
-use landd_core::custody::{self, CustodyEnvelopeV2, CustodyError, SigningKey};
+use landd_core::custody::{self, CustodyEnvelope, CustodyError, SigningKey};
 use landd_core::delivery::{
     AncestryEvidence, Binding, DeclineEvidence, DeliveryError, DeliveryJournal, DeliveryState, JournalError,
 };
@@ -126,7 +126,7 @@ pub struct BatchReport {
     pub tally: Tally,
     pub compose_ms: f64,
     pub total_ms: f64,
-    pub receipt: Option<CustodyEnvelopeV2>,
+    pub receipt: Option<CustodyEnvelope>,
 }
 
 impl BatchReport {
@@ -768,7 +768,7 @@ impl<'a> Train<'a> {
                 "unit_view": self.runner.profile().description["unit_view"],
             });
             let subject = custody::ref_update_subject(&self.repo_id, target_ref, base, &tip);
-            let receipt = CustodyEnvelopeV2::seal(key, key_id, &self.config.seat, "land-receipt", subject, claims)?;
+            let receipt = CustodyEnvelope::seal(key, key_id, &self.config.seat, "land-receipt", subject, claims)?;
             let option = format!("{}={}", custody::PUSH_OPTION, hex_encode(&receipt.to_wire()?));
             if option.len() > custody::MAX_PUSH_OPTION_BYTES {
                 return Err(TrainError::ReceiptTooLarge(option.len()));

@@ -3,7 +3,7 @@
 A Rust workspace providing:
 
 1. **`ast-sweep`**: a single-pass, content-addressed `Map(git_blob_oid -> FileFacts) -> Reduce(AllFacts -> Vec<RuleVerdict>)` static tree checker meant to replace many separate whole-tree Python walkers. Per-blob summaries are cached forever (no wall-clock TTL), so a land touching N files parses N blobs.
-2. **`landd`**: a speculative `git merge-tree --write-tree` batch merge train, a value-addressed admissibility engine, a durable `Delivery` CAS outbox, an extensible v2 custody envelope, and an offline `land_runs.jsonl` reader and replay.
+2. **`landd`**: a speculative `git merge-tree --write-tree` batch merge train, a value-addressed admissibility engine, a durable `Delivery` CAS outbox, an extensible signed custody envelope, and an offline `land_runs.jsonl` reader and replay.
 
 This document is the design contract. Where it gives a number, the number is either labelled a **goal** or cited from [HARDENING.md](HARDENING.md), which records what was measured and on what. The first version of this document stated latency figures (a `<5 ms` incremental sweep, a `<80 ms` cold sweep, a `<10 ms` cone export) as if they were properties of the design. They are not achieved: `git ls-tree` alone costs about 10 ms on the benchmark tree, and a cold sweep is bounded by parsing. They are removed here rather than repeated.
 
@@ -17,7 +17,7 @@ This document is the design contract. Where it gives a number, the number is eit
    - State machine `Fresh | Unknown | Refused { attempts, not_before } | Declined { evidence } | Completed { evidence }`, persisted (exclusive create of a new revision, synced with its directory chain) *before* the network send, keyed by a domain-separated BLAKE3 of the canonical binding `{ repo, target_ref, lane_tip, expected_old, merged_head }`.
    - `Declined` is terminal against `start()`, `refused()` and `declined()`, and can only be entered from `Fresh` or `Refused`: an outstanding send (`Unknown`) must be settled by reading the destination. `complete(evidence)` succeeds from every state when the evidence names this repository, ref and lane tip.
    - Merge commits are a function of their parents (fixed committer, date = the later parent date), so a retry of the same composition is the same binding: refusals accumulate and `max_refusals` is reachable. A per-lane-tip pointer finds the latest binding after a restart or a moved base.
-4. **Per-seat signed custody (`CustodyEnvelopeV2`).**
+4. **Per-seat signed custody (`CustodyEnvelope`).**
    - `sign(key, "landd-custody/v2\n" || BLAKE3(canonical_header) || BLAKE3(canonical_claims))` with Ed25519, SSHSIG-Ed25519 or HMAC-SHA256. Claims are open-ended: a verifier needs no list of permitted claim names, and any change to header or claims after sealing fails closed.
    - A trusted key carries the seats and envelope kinds it may attest; a valid signature outside that grant is refused. A land receipt's subject binds the repository identity, the ref, and the old and new commits.
    - Receipts are sealed only when units ran in the sandbox (§1.5); the configuration, the runner and the train each refuse otherwise.
@@ -31,6 +31,10 @@ This document is the design contract. Where it gives a number, the number is eit
    - A candidate is admissible iff every unit of either tree is accounted for: same cone digest as base (transported, 0 runs); `Pass` at the candidate cone; or `Fail { items }` whose items are a subset of the base's `Fail { items }` (inherited). A crash or timeout is not comparable with anything unless the operator sets `inherit_coarse_failures`. A unit present on the base and absent from the candidate blocks unless `allow_unit_removal`.
    - `why_not` names every blocking unit and the input paths that moved under it.
 7. **Operational limits are runtime settings** (`LandConfig` TOML/JSON plus `--set key=value`); see `examples/landd.toml`.
+
+### Pod ledger
+
+The pod service and each authenticated `pod-step --stream` session hold one SQLite connection. The database must enter WAL mode. Claims and completions commit at `synchronous=NORMAL` before acknowledgement, so they survive a daemon SIGKILL. A power loss can roll back recent claims or completions. Each open reserves a new epoch at `FULL`, and every claim uses the database's current epoch under its write transaction. Reclaiming an expired task therefore issues a higher fencing token even when an older connection performs the reclaim. Lead changes commit at `FULL`. The HTTP service returns tokens as decimal strings. The stream also uses decimal strings for tokens beyond JavaScript's exact integer range.
 
 ---
 
@@ -55,7 +59,7 @@ The rule pack is an operator path and is never read from the tree under test. A 
 
 ## 3. Workspace Crate Layout
 
-- **`crates/landd-core`**: `Oid`, `Digest32`, canonical JSON, `LandConfig`, the `Delivery` journal, `CustodyEnvelopeV2`, the admissibility engine, git plumbing (`ls-tree -z`, pooled `cat-file --batch`, `merge-tree`, lease push, network deadlines).
+- **`crates/landd-core`**: `Oid`, `Digest32`, canonical JSON, `LandConfig`, the `Delivery` journal, `CustodyEnvelope`, the admissibility engine, git plumbing (`ls-tree -z`, pooled `cat-file --batch`, `merge-tree`, lease push, network deadlines).
 - **`crates/ast-sweep`**: tree reader (git or directory), the per-blob facts cache, the tree-sitter extractor, the dependency graph and cones, and eight declarative rule kinds (`no_tracked_bytecode`, `no_bare_python_recipe`, `flock_bounded`, `atomic_replace_owner`, `uncatalogued_settings_keys`, `forbidden_symbol_or_call`, `single_owner_pattern`, `python_import_graph`).
 - **`crates/landd-train`**: composition, the runner, the train (judge, bisect, deliver), the lane queue.
 - **`crates/landd-sim`**: ledger reader (real `fleet` schema), observed metrics, and a discrete-event replay that runs only when the ledger records per-run module sets and costs.
@@ -79,7 +83,7 @@ Every subsystem carries positive and negative (`tooth_`) tests. The ones this co
 
 - **Cone cache**: one byte in a transitive dependency changes the cone digest; a disjoint change preserves it byte for byte; a revert restores it and hits a verdict whose file is ten years old; a data file a test opens is in its cone; mode changes and gitlink bumps move cones.
 - **`Delivery`**: a lost reply refuses `start()`; `Declined` refuses `start()` at `u64::MAX` yet completes on destination evidence; an outstanding send cannot be declined unread; a mismatched binding under one key errors; a saturated send counter refuses instead of wrapping.
-- **`CustodyEnvelopeV2`**: unknown claims verify with the original signature; any change to claims, header or domain tag fails closed; a key outside its grant, a receipt for another repository, and non-canonical wire bytes are refused.
+- **`CustodyEnvelope`**: unknown claims verify with the original signature; any change to claims, header or domain tag fails closed; a key outside its grant, a receipt for another repository, and non-canonical wire bytes are refused.
 - **Train**: `[good1, bad2, conflict3, good4]` isolates `bad2`, declines `conflict3`, and lands `good1 + good4` as a 2-parent chain with no force-push; stacked lanes; carried vs landed; unit removal; an unread send settled from the destination.
 - **Runner**: a sandboxed unit cannot reach the signing key, the state directory, the repository, sibling results or the host process table; hostile result files do not hang the supervisor.
 - **Benchmark**: `landd sweep` cold vs warm against a pinned commit of a real repository, reporting milliseconds and findings (env-gated; results in HARDENING.md).

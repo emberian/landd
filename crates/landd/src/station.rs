@@ -12,6 +12,21 @@ use std::time::Duration;
 
 pub type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
+/// `--repo` and `--config`: the station a one-shot command runs against.
+#[derive(clap::Args)]
+pub struct StationArgs {
+    #[arg(long)]
+    repo: PathBuf,
+    #[arg(long)]
+    config: PathBuf,
+}
+
+impl StationArgs {
+    pub fn open(&self) -> Result<Station, AnyError> {
+        Station::open(&self.repo, load_config(Some(&self.config), &[])?)
+    }
+}
+
 pub struct Station {
     pub repo: GitRepo,
     pub config: LandConfig,
@@ -135,5 +150,63 @@ impl Station {
             Some((key_id, key)) => train.with_signer(key_id.clone(), key.clone())?,
             None => train,
         })
+    }
+
+    /// An authenticated OBB sidecar binds the upstream evidence digest and the
+    /// landd gate/runner equivalence. changed_paths is never a dependency cone.
+    pub fn cone_receipt(&self, bytes: &[u8]) -> Result<landd_core::cone_receipt::ConeReceipt, AnyError> {
+        use landd_core::{cone_receipt::ConeReceipt, Digest32, Oid};
+        #[derive(serde::Deserialize)]
+        struct Judge {
+            receipt_version: u32,
+            receipt_hash: Digest32,
+            judge_name: String,
+            gate_sha256: Digest32,
+            tree_oid: Oid,
+            all_passed: bool,
+            clean_working_tree: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Evidence {
+            Obb {
+                judge_receipt_json: String,
+                judge_file_sha256: Digest32,
+                obb_gate_sha256: Digest32,
+                cone_attestation: ConeReceipt,
+            },
+            Native(ConeReceipt),
+        }
+        if serde_json::from_slice::<serde_json::Value>(bytes)?.get("receipt_version").is_some() {
+            let key = std::fs::read(self.state.join("obb-receipt.key"))?;
+            return landd_core::cone_receipt::native_obb(&self.repo, bytes, &key, &self.config.obb_grants);
+        }
+        match serde_json::from_slice(bytes)? {
+            Evidence::Native(r) => Ok(r),
+            Evidence::Obb { judge_receipt_json, judge_file_sha256, obb_gate_sha256, cone_attestation: r } => {
+                use sha2::{Digest, Sha256};
+                let j: Judge = serde_json::from_str(&judge_receipt_json)?;
+                let actual = Digest32::from_bytes(Sha256::digest(judge_receipt_json.as_bytes()).into());
+                // OBB hashes compact serde JSON in declaration order. Keep the upstream
+                // field order (including nested floor evaluations) when checking its file.
+                let mut payload: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&judge_receipt_json)?;
+                payload.shift_remove("receipt_hash");
+                payload.shift_remove("receipt_mac");
+                let signable = Digest32::from_bytes(Sha256::digest(serde_json::to_vec(&payload)?).into());
+                if j.receipt_version == 1
+                    && actual == judge_file_sha256
+                    && j.receipt_hash == signable
+                    && j.judge_name == r.judge_name
+                    && j.gate_sha256 == obb_gate_sha256
+                    && j.tree_oid == r.tree_oid
+                    && j.all_passed
+                    && j.clean_working_tree
+                {
+                    Ok(r)
+                } else {
+                    Err("OBB judge receipt disagrees with its authenticated cone attestation".into())
+                }
+            }
+        }
     }
 }

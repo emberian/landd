@@ -1,5 +1,5 @@
 //! Shared foundation for `landd`: content-addressed identifiers, canonical
-//! JSON, runtime configuration, the `Delivery` outbox, the v2 custody
+//! JSON, runtime configuration, the `Delivery` outbox, the custody
 //! envelope, cone admissibility and the git plumbing every other crate uses.
 
 pub mod canon;

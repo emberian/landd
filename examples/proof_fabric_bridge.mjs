@@ -1,4 +1,4 @@
-// SIG supplies verifyProofReceiptEnvelope's signature-verifying callback.
+// A proof fabric (for example SIG) supplies verifyProofReceiptEnvelope's signature-verifying callback.
 // The producer embeds the landd receipt in its signed payload.outcome.coneReceipt.
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
@@ -22,7 +22,7 @@ function invoke(binary, args, input) {
   })
 }
 
-export function createAdapter({ binary = 'landd', repo, config, authenticate, validObligation, database, leadPrincipal }) {
+export function createBridge({ binary = 'landd', repo, config, authenticate, validObligation, database, leadPrincipal }) {
   const station = ['--repo', repo, '--config', config]
   const workers = new Map()
   function podWorker(principal) {

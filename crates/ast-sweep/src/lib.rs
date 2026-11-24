@@ -20,5 +20,5 @@ pub use cache::BlobFactsCache;
 pub use facts::{FileFacts, FileKind};
 pub use imports::{ImportCone, ImportGraph};
 pub use reduce::{Finding, RuleVerdict, VerdictStatus};
-pub use rules::{ImportConfig, Rule, RuleKind, RulePack};
+pub use rules::{BareImports, ImportConfig, Rule, RuleKind, RulePack};
 pub use sweep::{run_sweep, sweep_dir, sweep_git, AllFacts, FileEntry, Source, SweepError, SweepReport, SweepStats};

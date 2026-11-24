@@ -71,7 +71,13 @@ thread_local! {
 pub fn extract(kind: FileKind, source: &[u8]) -> FileFacts {
     match kind {
         FileKind::Python => extract_python(source),
-        FileKind::TypeScript | FileKind::Tsx | FileKind::Lean | FileKind::Rust => crate::modules::extract(kind, source),
+        FileKind::TypeScript
+        | FileKind::Tsx
+        | FileKind::Dts
+        | FileKind::TsConfig
+        | FileKind::PackageJson
+        | FileKind::Lean
+        | FileKind::Rust => crate::modules::extract(kind, source),
         FileKind::Recipe => extract_recipe(source),
         FileKind::Sniff => {
             let first = source.split(|b| *b == b'\n').next().unwrap_or_default();

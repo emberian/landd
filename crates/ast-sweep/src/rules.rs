@@ -123,6 +123,18 @@ impl Rule {
     }
 }
 
+/// A TypeScript or JavaScript specifier that is neither relative, a workspace package, nor claimed by `tsconfig` paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BareImports {
+    /// An external leaf: `node:*` built-ins add no tree inputs, and bare npm packages bind deterministically to the
+    /// nearest lockfile (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`) when present.
+    #[default]
+    External,
+    /// Widen the cone to the whole tree, as an unresolved load does.
+    Widen,
+}
+
 /// What a cone does about a read it cannot bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -207,6 +219,16 @@ pub struct ImportConfig {
     pub cone_model: ConeModel,
     #[serde(default)]
     pub unverified_loaders: UnverifiedLoaders,
+    /// Explicit TypeScript `compilerOptions.paths` overrides (`@/*` -> `["./src/*"]`), resolved relative to
+    /// `ts_base_url` before any auto-discovered `tsconfig.json` in the tree.
+    #[serde(default)]
+    pub ts_paths: BTreeMap<String, Vec<String>>,
+    /// Explicit `compilerOptions.baseUrl` for `ts_paths` (empty is the tree root).
+    #[serde(default)]
+    pub ts_base_url: String,
+    /// What a non-relative specifier that no `tsconfig` alias or workspace package claims does to a cone.
+    #[serde(default)]
+    pub bare_imports: BareImports,
 }
 
 impl Default for ImportConfig {
@@ -222,6 +244,9 @@ impl Default for ImportConfig {
             whole_tree_calls: Vec::new(),
             cone_model: ConeModel::default(),
             unverified_loaders: UnverifiedLoaders::default(),
+            ts_paths: BTreeMap::new(),
+            ts_base_url: String::new(),
+            bare_imports: BareImports::default(),
         }
     }
 }

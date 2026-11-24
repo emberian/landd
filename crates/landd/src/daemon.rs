@@ -391,7 +391,20 @@ pub fn serve(socket: &Path, station: &Station) -> io::Result<()> {
     cleanup
 }
 
-fn lock_file(path: &Path) -> io::Result<std::fs::File> {
+/// An exclusive `flock` released on drop with an explicit `LOCK_UN`. Closing our descriptor is not enough: the lock
+/// belongs to the open file description, and a child forked by another thread holds a duplicate of every descriptor
+/// until its `exec` closes the `O_CLOEXEC` ones. Unlocking through our descriptor releases it for every duplicate.
+#[derive(Debug)]
+struct FileLock(std::fs::File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // SAFETY: `flock` on a descriptor this value owns; no memory is involved.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn lock_file(path: &Path) -> io::Result<FileLock> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -403,7 +416,7 @@ fn lock_file(path: &Path) -> io::Result<std::fs::File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("another daemon holds {}", path.display())));
     }
-    Ok(file)
+    Ok(FileLock(file))
 }
 
 pub fn call(socket: &Path, request: &Request) -> io::Result<Response> {
@@ -501,6 +514,30 @@ mod tests {
         assert_eq!(lock_file(&lock_path).unwrap_err().kind(), io::ErrorKind::AddrInUse);
         drop(held);
         assert!(lock_file(&lock_path).is_ok());
+    }
+
+    #[test]
+    fn tooth_flock_releases_immediately_despite_concurrent_fork_fd_dups() {
+        use std::sync::atomic::AtomicBool;
+        let dir = landd_core::git::testkit::private_tempdir().unwrap();
+        let lock_path = dir.path().join("queue.lock");
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/sh").args(["-c", ":"]).status();
+                    }
+                });
+            }
+            for i in 0..400 {
+                let held = lock_file(&lock_path).unwrap_or_else(|e| panic!("iteration {i} acquire failed: {e}"));
+                drop(held);
+                let relocked = lock_file(&lock_path).unwrap_or_else(|e| panic!("iteration {i} re-acquire raced fd dup: {e}"));
+                drop(relocked);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 
     #[test]

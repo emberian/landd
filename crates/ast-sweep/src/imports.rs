@@ -418,6 +418,8 @@ struct Context<'a> {
     stems: HashMap<&'a str, Vec<u32>>,
     /// Directory name -> directories of that name that hold Python.
     dirs: HashMap<&'a str, Vec<&'a str>>,
+    /// Precomputed `tsconfig` aliases, monorepo `package.json` workspaces, and lockfiles for TS/JS resolution.
+    ts_index: crate::modules::TsProjectIndex,
 }
 
 impl Context<'_> {
@@ -647,6 +649,7 @@ impl ImportGraph {
             }
         }
 
+        let ts_index = crate::modules::TsProjectIndex::build(all, config);
         let context = Context {
             all,
             paths,
@@ -657,6 +660,7 @@ impl ImportGraph {
             whole_calls: GlobSet::new(&config.whole_tree_calls),
             stems,
             dirs,
+            ts_index,
         };
         let nodes: Vec<Option<NodeOut>> =
             light_pool().install(|| (0..count).into_par_iter().map(|index| graph.node(&context, index as u32)).collect());
@@ -942,15 +946,36 @@ impl ImportGraph {
         }
         if let Some(kind) = file.kind.filter(|kind| crate::modules::supported(*kind)) {
             let facts = file.facts.as_deref()?;
-            if facts.parse_error || facts.too_large || facts.truncated {
+            if facts.parse_error || facts.truncated {
                 out.causes.push(Cause::ParseError);
             }
-            for name in &facts.module_paths {
-                let paths = crate::modules::resolve(kind, &file.path, name, &context.config.roots);
-                let before = out.targets.len();
-                out.targets.extend(paths.iter().filter_map(|p| context.all.index_of(p).map(|i| i as u32)));
-                if out.targets.len() == before {
-                    out.causes.push(Cause::UnresolvedLoad);
+            if facts.too_large {
+                out.causes.push(Cause::TooLarge);
+            }
+            if !facts.dynamic_loads.is_empty() && context.config.cone_model == ConeModel::Strict {
+                out.causes.push(Cause::DynamicLoad);
+            }
+            if matches!(kind, FileKind::TypeScript | FileKind::Tsx | FileKind::Dts) {
+                for name in &facts.module_paths {
+                    let res = context.ts_index.resolve_ts(kind, &file.path, name, context.config, |p, targets| {
+                        context.lookup(p, targets);
+                    });
+                    out.targets.extend(res.targets);
+                    out.reads.extend(res.reads);
+                    if res.unresolved {
+                        out.causes.push(Cause::UnresolvedLoad);
+                    }
+                }
+            } else {
+                for name in &facts.module_paths {
+                    let paths = crate::modules::resolve(kind, &file.path, name, context.config);
+                    let before = out.targets.len();
+                    for p in &paths {
+                        context.lookup(p, &mut out.targets);
+                    }
+                    if out.targets.len() == before {
+                        out.causes.push(Cause::UnresolvedLoad);
+                    }
                 }
             }
             return Some(out);
@@ -1301,6 +1326,7 @@ impl ImportGraph {
             }
             let Some(facts) = py_facts[index] else {
                 scopes.state_edges[top_s as usize].extend(self.edges[index].iter().map(|i| scopes.file_states[*i as usize].2));
+                scopes.state_reads[top_s as usize].extend(&self.reads[index]);
                 scopes.state_causes[top_s as usize].extend(&self.causes[index]);
                 continue;
             };

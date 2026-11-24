@@ -22,6 +22,7 @@ pub fn facts_version() -> &'static str {
             "ast-sweep facts version",
             &[
                 env!("CARGO_PKG_VERSION").as_bytes(),
+                b"oxc-0.133",
                 &(language.abi_version() as u64).to_le_bytes(),
                 &(language.node_kind_count() as u64).to_le_bytes(),
                 include_bytes!("extract.rs"),
@@ -40,6 +41,9 @@ pub enum FileKind {
     Python,
     TypeScript,
     Tsx,
+    Dts,
+    TsConfig,
+    PackageJson,
     Rust,
     Lean,
     /// Makefiles, justfiles, shell scripts and CI YAML: scanned by line.
@@ -67,9 +71,22 @@ impl FileKind {
         if name.ends_with(".py") {
             return Some(Self::Python);
         }
+        if name == "package.json" {
+            return Some(Self::PackageJson);
+        }
+        if name == "jsconfig.json" || (name.starts_with("tsconfig") && name.ends_with(".json") && !name.ends_with(".decl.json")) {
+            return Some(Self::TsConfig);
+        }
+        if name.ends_with(".d.ts")
+            || name.ends_with(".d.mts")
+            || name.ends_with(".d.cts")
+            || (name.ends_with(".ts") && name.contains(".d."))
+        {
+            return Some(Self::Dts);
+        }
         match name.rsplit_once('.').map(|(_, ext)| ext) {
-            Some("ts" | "js" | "mts" | "mjs") => return Some(Self::TypeScript),
-            Some("tsx") => return Some(Self::Tsx),
+            Some("ts" | "js" | "mts" | "mjs" | "cts" | "cjs") => return Some(Self::TypeScript),
+            Some("tsx" | "jsx") => return Some(Self::Tsx),
             Some("rs") => return Some(Self::Rust),
             Some("lean") => return Some(Self::Lean),
             _ => {}
@@ -88,6 +105,9 @@ impl FileKind {
             Self::Python => "py",
             Self::TypeScript => "ts",
             Self::Tsx => "tsx",
+            Self::Dts => "dts",
+            Self::TsConfig => "tsconfig",
+            Self::PackageJson => "pkgjson",
             Self::Lean => "lean",
             Self::Rust => "rs",
             Self::Recipe => "recipe",
@@ -288,8 +308,27 @@ pub struct SymbolRef {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TsConfigFacts {
+    pub extends: Vec<String>,
+    pub base_url: Option<String>,
+    pub paths: Vec<(String, Vec<String>)>,
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageJsonFacts {
+    pub name: Option<String>,
+    /// `(subpath_pattern, candidate_targets)` extracted from `exports`, `source`, `module`, `main`, and `types`.
+    pub exports: Vec<(String, Vec<String>)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFacts {
     pub module_paths: Vec<String>,
+    #[serde(default)]
+    pub tsconfig: Option<TsConfigFacts>,
+    #[serde(default)]
+    pub package_json: Option<PackageJsonFacts>,
     pub language: Language,
     /// The parser reported a syntax error, or the bytes are not UTF-8;
     /// facts cover what did parse.
@@ -357,9 +396,22 @@ mod tests {
         for recipe in ["Makefile", "ci/build.sh", ".github/workflows/ci.yml", "Dockerfile.dev", "justfile", "x.mk"] {
             assert_eq!(FileKind::of_entry(recipe, 0o100644), Some(FileKind::Recipe), "{recipe}");
         }
-        for other in ["a.pyc", "README.md", "data.json", "x.python"] {
+        for other in ["a.pyc", "README.md", "data.json", "x.python", "tsconfig.json.decl.json"] {
             assert_eq!(FileKind::of_entry(other, 0o100644), None, "{other}");
         }
+        for dts in ["a.d.ts", "a.d.mts", "a.d.cts", "styles.d.css.ts"] {
+            assert_eq!(FileKind::of_entry(dts, 0o100644), Some(FileKind::Dts), "{dts}");
+        }
+        for ts in ["a.ts", "a.mts", "a.cts", "a.js", "a.mjs", "a.cjs"] {
+            assert_eq!(FileKind::of_entry(ts, 0o100644), Some(FileKind::TypeScript), "{ts}");
+        }
+        for tsx in ["a.tsx", "a.jsx"] {
+            assert_eq!(FileKind::of_entry(tsx, 0o100644), Some(FileKind::Tsx), "{tsx}");
+        }
+        for cfg in ["tsconfig.json", "tsconfig.app.json", "sub/tsconfig.vitest.json", "jsconfig.json"] {
+            assert_eq!(FileKind::of_entry(cfg, 0o100644), Some(FileKind::TsConfig), "{cfg}");
+        }
+        assert_eq!(FileKind::of_entry("packages/sdk/package.json", 0o100644), Some(FileKind::PackageJson));
         // Extensionless and executable files are sniffed; links are links whatever their name.
         assert_eq!(FileKind::of_entry("bin/tool", 0o100755), Some(FileKind::Sniff));
         assert_eq!(FileKind::of_entry("bin/tool", 0o100644), Some(FileKind::Sniff));
